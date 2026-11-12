@@ -1,0 +1,443 @@
+// Copyright 2025 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !js
+
+package file_test
+
+import (
+	"errors"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/file"
+)
+
+func TestFSReadDir(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "foo.txt"), filepath.Join("testdata", "dir")})
+
+	rootEnts, err := fs.ReadDir(vfs, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rootEnts) != 2 {
+		t.Errorf("len(ents): got: %d, want: %d", len(rootEnts), 2)
+	}
+	slices.SortFunc(rootEnts, func(a, b fs.DirEntry) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	if got, want := rootEnts[0].Name(), "dir"; got != want {
+		t.Errorf("ents[0].Name(): got: %s, want: %s", got, want)
+	}
+	if got, want := rootEnts[0].IsDir(), true; got != want {
+		t.Errorf("ents[0].IsDir(): got: false, want: true")
+	}
+	if got, want := rootEnts[1].Name(), "foo.txt"; got != want {
+		t.Errorf("ents[1].Name(): got: %s, want: %s", got, want)
+	}
+	if got, want := rootEnts[1].IsDir(), false; got != want {
+		t.Errorf("ents[1].IsDir(): got: true, want: false")
+	}
+
+	subEnts, err := fs.ReadDir(vfs, "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subEnts) != 2 {
+		t.Errorf("len(ents): got: %d, want: %d", len(subEnts), 1)
+	}
+	slices.SortFunc(subEnts, func(a, b fs.DirEntry) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
+	if got, want := subEnts[0].Name(), "foo.txt"; got != want {
+		t.Errorf("ents[0].Name(): got: %s, want: %s", got, want)
+	}
+	if got, want := subEnts[0].IsDir(), false; got != want {
+		t.Errorf("ents[0].IsDir(): got: false, want: true")
+	}
+	if got, want := subEnts[1].Name(), "qux.txt"; got != want {
+		t.Errorf("ents[1].Name(): got: %s, want: %s", got, want)
+	}
+	if got, want := subEnts[1].IsDir(), false; got != want {
+		t.Errorf("ents[1].IsDir(): got: true, want: false")
+	}
+
+	if _, err := fs.ReadDir(vfs, "baz.txt"); err == nil {
+		t.Errorf("fs.ReadDir on a file must return an error")
+	}
+}
+
+func TestFSReadFile(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "foo.txt"), filepath.Join("testdata", "dir")})
+
+	content, err := fs.ReadFile(vfs, "foo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(content), "foo\n"; got != want {
+		t.Errorf("content: got: %q, want: %q", got, want)
+	}
+
+	subContent, err := fs.ReadFile(vfs, "dir/foo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(subContent), "dir/foo\n"; got != want {
+		t.Errorf("content: got: %q, want: %q", got, want)
+	}
+
+	if _, err := fs.ReadFile(vfs, "."); err == nil {
+		t.Errorf("fs.ReadFile on the root directory must return an error")
+	}
+
+	if _, err := fs.ReadFile(vfs, "dir"); err == nil {
+		t.Errorf("fs.ReadFile on a directory must return an error")
+	}
+
+	if _, err := fs.ReadFile(vfs, "bar.txt"); err == nil {
+		t.Errorf("fs.ReadFile on a file not in the file system must return an error")
+	}
+}
+
+func newVirtualFS(t *testing.T, paths []string) fs.FS {
+	t.Helper()
+
+	vfs, err := file.NewVirtualFS(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vfs
+}
+
+func dirEntryNames(t *testing.T, vfs fs.FS, name string) []string {
+	t.Helper()
+
+	ents, err := fs.ReadDir(vfs, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(ents))
+	for _, ent := range ents {
+		names = append(names, ent.Name())
+	}
+	slices.Sort(names)
+	return names
+}
+
+func TestFSSameBaseNames(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "foo.txt"), filepath.Join("testdata", "dir", "foo.txt")})
+
+	// The paths are not in the same directory, so the root directory is their common ancestor directory.
+	if got, want := dirEntryNames(t, vfs, "."), []string{"dir", "foo.txt"}; !slices.Equal(got, want) {
+		t.Errorf("names: got: %v, want: %v", got, want)
+	}
+
+	// "dir" is not a given path. Only the given path under it must be listed.
+	if got, want := dirEntryNames(t, vfs, "dir"), []string{"foo.txt"}; !slices.Equal(got, want) {
+		t.Errorf("names: got: %v, want: %v", got, want)
+	}
+
+	// The files share their base names, but must be distinguishable.
+	content, err := fs.ReadFile(vfs, "foo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(content), "foo\n"; got != want {
+		t.Errorf("content: got: %q, want: %q", got, want)
+	}
+
+	subContent, err := fs.ReadFile(vfs, "dir/foo.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(subContent), "dir/foo\n"; got != want {
+		t.Errorf("content: got: %q, want: %q", got, want)
+	}
+
+	if _, err := fs.ReadFile(vfs, "dir/qux.txt"); err == nil {
+		t.Errorf("fs.ReadFile on a file not in the file system must return an error")
+	}
+}
+
+func TestFSPathUnderAnotherPath(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "dir"), filepath.Join("testdata", "dir", "foo.txt")})
+
+	if got, want := dirEntryNames(t, vfs, "."), []string{"dir"}; !slices.Equal(got, want) {
+		t.Errorf("names: got: %v, want: %v", got, want)
+	}
+
+	// "dir" itself is given, so its content must be listed as it is.
+	if got, want := dirEntryNames(t, vfs, "dir"), []string{"foo.txt", "qux.txt"}; !slices.Equal(got, want) {
+		t.Errorf("names: got: %v, want: %v", got, want)
+	}
+}
+
+func TestFSRootDirectoryPath(t *testing.T) {
+	vfs := newVirtualFS(t, []string{string(filepath.Separator), filepath.Join("testdata", "foo.txt")})
+
+	if got, want := dirEntryNames(t, vfs, "."), []string{"foo.txt"}; !slices.Equal(got, want) {
+		t.Errorf("names: got: %v, want: %v", got, want)
+	}
+}
+
+func absPath(t *testing.T, entry any) string {
+	t.Helper()
+
+	a, ok := entry.(interface{ AbsPath() string })
+	if !ok {
+		t.Fatalf("%T must have an AbsPath method", entry)
+	}
+	return a.AbsPath()
+}
+
+func TestFSAbsPath(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "foo.txt"), filepath.Join("testdata", "dir", "foo.txt")})
+
+	base, err := filepath.Abs("testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "dir" is not a given path, but it still has a path in the real file system.
+	want := map[string]string{
+		"dir":     filepath.Join(base, "dir"),
+		"foo.txt": filepath.Join(base, "foo.txt"),
+	}
+	ents, err := fs.ReadDir(vfs, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range ents {
+		if got, want := absPath(t, ent), want[ent.Name()]; got != want {
+			t.Errorf("AbsPath() for %s: got: %s, want: %s", ent.Name(), got, want)
+		}
+	}
+
+	subEnts, err := fs.ReadDir(vfs, "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(subEnts) != 1 {
+		t.Fatalf("len(subEnts): got: %d, want: %d", len(subEnts), 1)
+	}
+	if got, want := absPath(t, subEnts[0]), filepath.Join(base, "dir", "foo.txt"); got != want {
+		t.Errorf("AbsPath(): got: %s, want: %s", got, want)
+	}
+
+	// Opened files and directories report their paths as well, including
+	// directories created only to reach the given files.
+	for _, name := range []string{".", "dir", "dir/foo.txt"} {
+		t.Run(name, func(t *testing.T) {
+			f, err := vfs.Open(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = f.Close()
+			}()
+			if got, want := absPath(t, f), filepath.Join(base, filepath.FromSlash(name)); got != want {
+				t.Errorf("AbsPath(): got: %s, want: %s", got, want)
+			}
+		})
+	}
+}
+
+func TestFSRealDirectoryEntriesAbsPath(t *testing.T) {
+	base, err := filepath.Abs(filepath.Join("testdata", "dir"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		given string
+	}{
+		{
+			name:  "dir",
+			given: filepath.Join("testdata", "dir"),
+		},
+		{
+			name:  "testdata/dir",
+			given: "testdata",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			vfs := newVirtualFS(t, []string{c.given})
+			check := func(ents []fs.DirEntry) {
+				for _, ent := range ents {
+					if got, want := absPath(t, ent), filepath.Join(base, ent.Name()); got != want {
+						t.Errorf("AbsPath(): got: %s, want: %s", got, want)
+					}
+				}
+			}
+			ents, err := fs.ReadDir(vfs, c.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := len(ents), 2; got != want {
+				t.Errorf("len(entries): got %d, want %d", got, want)
+			}
+			check(ents)
+			f, err := vfs.Open(c.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = f.Close() }()
+			dir, ok := f.(fs.ReadDirFile)
+			if !ok {
+				t.Fatalf("%T must implement fs.ReadDirFile", f)
+			}
+			var count int
+			for {
+				ents, err := dir.ReadDir(1)
+				check(ents)
+				count += len(ents)
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, want := count, 2; got != want {
+				t.Errorf("opened entries: got %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestFSDirectoryReadError(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "foo.txt"), filepath.Join("testdata", "dir", "foo.txt")})
+	for _, name := range []string{".", "dir"} {
+		f, err := vfs.Open(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = f.Read(make([]byte, 1))
+		if closeErr := f.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		var pathErr *fs.PathError
+		if !errors.As(err, &pathErr) {
+			t.Errorf("%s: got error %v, want *fs.PathError", name, err)
+			continue
+		}
+		if got, want := pathErr.Path, name; got != want {
+			t.Errorf("Path: got %q, want %q", got, want)
+		}
+		if got, want := pathErr.Op, "read"; got != want {
+			t.Errorf("Op: got %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFSPathErrors(t *testing.T) {
+	vfs := newVirtualFS(t, []string{filepath.Join("testdata", "dir")})
+	const name = "dir/missing"
+	for _, op := range []string{"open", "readfile", "readdir"} {
+		t.Run(op, func(t *testing.T) {
+			var err error
+			switch op {
+			case "open":
+				var f fs.File
+				f, err = vfs.Open(name)
+				if f != nil {
+					defer func() {
+						_ = f.Close()
+					}()
+				}
+			case "readfile":
+				_, err = fs.ReadFile(vfs, name)
+			case "readdir":
+				_, err = fs.ReadDir(vfs, name)
+			}
+			var pathErr *fs.PathError
+			if !errors.As(err, &pathErr) {
+				t.Fatalf("error = %v, want *fs.PathError", err)
+			}
+			if pathErr.Path != name {
+				t.Errorf("Path = %q, want %q", pathErr.Path, name)
+			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("error = %v, want fs.ErrNotExist", err)
+			}
+		})
+	}
+}
+
+func TestFSReadDirSorted(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"a", "Z", "b", "Y"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vfs := newVirtualFS(t, []string{dir})
+	entries, err := fs.ReadDir(vfs, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(entries))
+	for i, entry := range entries {
+		names[i] = entry.Name()
+	}
+	if want := []string{"Y", "Z", "a", "b"}; !slices.Equal(names, want) {
+		t.Errorf("ReadDir names: got %v, want %v", names, want)
+	}
+}
+
+func TestFSReadDirResumeAfterError(t *testing.T) {
+	dir := t.TempDir()
+	paths := []string{filepath.Join(dir, "a"), filepath.Join(dir, "b")}
+	for _, path := range paths {
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	vfs := newVirtualFS(t, paths)
+	f, err := vfs.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := os.Remove(paths[1]); err != nil {
+		t.Fatal(err)
+	}
+	d := f.(fs.ReadDirFile)
+	entries, err := d.ReadDir(-1)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ReadDir: got %v, want ErrNotExist", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "a" {
+		t.Fatalf("ReadDir: got %v, want only a", entries)
+	}
+	if err := os.WriteFile(paths[1], nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = d.ReadDir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "b" {
+		t.Errorf("ReadDir retry: got %v, want only b", entries)
+	}
+	if entries, err := d.ReadDir(1); len(entries) != 0 || err != io.EOF {
+		t.Errorf("ReadDir at end: got %v, %v, want EOF", entries, err)
+	}
+}

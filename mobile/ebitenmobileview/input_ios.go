@@ -1,0 +1,147 @@
+// Copyright 2016 Hajime Hoshi
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ebitenmobileview
+
+import (
+	"unicode"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/ui"
+)
+
+// #cgo CFLAGS: -x objective-c
+// #cgo LDFLAGS: -framework Foundation -framework UIKit
+//
+// #import <UIKit/UIKit.h>
+import "C"
+
+func init() {
+	ui.Get().SetKeyPressDispatcher(dispatchKeyPress)
+	ui.Get().SetKeyEventDispatchers(dispatchKeyDown, dispatchKeyUp)
+}
+
+// dispatchKeyPress records a key press, and its release, for a key the platform
+// text editor received instead of the game's view.
+func dispatchKeyPress(key ui.Key) {
+	inputMu.Lock()
+	defer inputMu.Unlock()
+	setKeyPressed(key)
+	setKeyReleased(key)
+	updateInput(nil)
+}
+
+// dispatchKeyDown records a key press for a key the platform text editor
+// received instead of the game's view.
+func dispatchKeyDown(key ui.Key) {
+	inputMu.Lock()
+	defer inputMu.Unlock()
+	setKeyPressed(key)
+	updateInput(nil)
+}
+
+// dispatchKeyUp records a key release for a key the platform text editor
+// received instead of the game's view.
+func dispatchKeyUp(key ui.Key) {
+	inputMu.Lock()
+	defer inputMu.Unlock()
+	setKeyReleased(key)
+	updateInput(nil)
+}
+
+var ptrToID = map[int64]int{}
+
+func resetInput() {
+	keyEvents = keyEvents[:0]
+	clear(touches)
+	clear(ptrToID)
+}
+
+func getIDFromPtr(ptr int64) int {
+	if id, ok := ptrToID[ptr]; ok {
+		return id
+	}
+	var maxID int
+	for _, id := range ptrToID {
+		maxID = max(maxID, id)
+	}
+	id := maxID + 1
+	ptrToID[ptr] = id
+	return id
+}
+
+func UpdateTouchesOnIOS(phase int, ptr int64, x, y float64) {
+	inputMu.Lock()
+	defer inputMu.Unlock()
+	switch phase {
+	case C.UITouchPhaseBegan, C.UITouchPhaseMoved, C.UITouchPhaseStationary:
+		id := getIDFromPtr(ptr)
+		touches[id] = position{x, y}
+		updateInput(nil)
+	case C.UITouchPhaseEnded, C.UITouchPhaseCancelled:
+		id := getIDFromPtr(ptr)
+		delete(ptrToID, ptr)
+		delete(touches, id)
+		updateInput(nil)
+	case C.UITouchPhaseRegionEntered, C.UITouchPhaseRegionMoved, C.UITouchPhaseRegionExited:
+		// A region phase reports hovering over the view without contact.
+	default:
+		// UIKit can add phases: ignore unknown ones instead of crashing.
+	}
+}
+
+func UpdatePressesOnIOS(phase int, keyCode int, keyString string, modifierFlags int) {
+	inputMu.Lock()
+	defer inputMu.Unlock()
+	// TODO: If a key is kept pressed, ignore the repeated key events.
+	// There seems no way to check whether a key event is a repeated event or not so far.
+	updateLockKeys(modifierFlags)
+
+	switch phase {
+	case C.UIPressPhaseStationary:
+		// A stationary key does not produce a new press.
+		// Do nothing here.
+	case C.UIPressPhaseBegan:
+		if ui.Get().IsKeyPressForComposition() {
+			// The key is typed into a composition, which the input method acts
+			// on. The release is still reported, so that the key cannot stick.
+			return
+		}
+		if key, ok := iosKeyToUIKey[keyCode]; ok {
+			setKeyPressed(key)
+		}
+		var runes []rune
+		for _, r := range keyString {
+			if !unicode.IsPrint(r) {
+				continue
+			}
+			runes = append(runes, r)
+		}
+		updateInput(runes)
+	case C.UIPressPhaseEnded, C.UIPressPhaseCancelled:
+		if key, ok := iosKeyToUIKey[keyCode]; ok {
+			setKeyReleased(key)
+		}
+		updateInput(nil)
+	default:
+		// UIKit can add phases like UIPressPhaseChanged, which reports a force
+		// change rather than a new key: ignore unknown ones instead of crashing.
+	}
+}
+
+// updateLockKeys takes the lock key states from a key event's modifier flags.
+func updateLockKeys(modifierFlags int) {
+	capsLock = ui.NewLockKeyStateFromBool(modifierFlags&C.UIKeyModifierAlphaShift != 0)
+	// iOS has no Num Lock: the numeric keypad always produces digits.
+	numLock = ui.LockKeyStateOn
+}

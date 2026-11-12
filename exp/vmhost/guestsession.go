@@ -1,0 +1,2018 @@
+// Copyright 2026 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package vmhost is the host side of virtualization: it drives an Ebitengine guest running in a
+// separate process over a connection, and renders the guest's frames into host-owned images on the
+// host's own GPU.
+//
+// The protocol is hidden behind the GuestSession API. A background goroutine owns the connection and
+// the guest's mirror images, so a slow or wedged guest never blocks the host's own frame.
+// [GuestSession.AdvanceTicks] drives the guest's Update and [GuestSession.AdvanceFrame] requests its
+// next frame; [GuestSession.CompositeFrame] composites the guest's most recently completed frame into
+// the host-owned screen set by [GuestSession.SetOutsideScreen] so the host can composite it into its
+// own window. The audio the guest plays is exposed per player — never mixed — through the
+// [NewGuestSessionOptions] OnAudioStream handler, which hands the host each new stream to observe and
+// play separately. The gamepad and device vibrations the guest requests are delivered to the
+// [NewGuestSessionOptions] OnGamepadVibration and OnVibration handlers. The handlers run during
+// [GuestSession.AdvanceTicks] and [GuestSession.WaitTicks], on the goroutine calling them, so a host
+// never deals with the session's own goroutine.
+//
+// Hosting guests requires multithread mode. [ebiten.RunGameOptions.SingleThread] and the
+// ebitenginesinglethread and ebitensinglethread build tags are not supported for hosts.
+// [NewGuestSession] or [ebiten.RunGameWithOptions] returns an error for this combination.
+// Close existing sessions before starting a single-threaded game.
+//
+// This package is experimental and the API might be changed in the future.
+package vmhost
+
+import (
+	"errors"
+	"fmt"
+	"image"
+	"io"
+	"maps"
+	"net"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/internal/clock"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphics"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicscommand"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver"
+	"github.com/hajimehoshi/ebiten/v2/internal/ui"
+	"github.com/hajimehoshi/ebiten/v2/internal/vmprotocol"
+)
+
+// GuestSession is a session with a guest process, driven and observed from the host side. It holds
+// no process handle: the guest's lifetime belongs to whoever spawned it.
+//
+// A background goroutine owns the connection and the guest's mirror images and performs all protocol
+// I/O, so the host's calls do not block on the guest. [GuestSession.CompositeFrame] composites into the
+// host's screen and [GuestSession.Close] releases the images it composites; these two must be called
+// from within the host's frame (its Update or Draw), and not concurrently with one another. The other
+// methods may be called from any goroutine.
+//
+// Guest read-backs are started within the host's frame by CompositeFrame, [GuestSession.WaitTicks],
+// or [GuestSession.WaitFrame]. Submitted read-backs can complete between frames while the host's
+// render loop is accepting work.
+type GuestSession struct {
+	// conn is safe for concurrent use: the session goroutine reads and writes through the codecs while
+	// Close pokes its deadline and closes it.
+	conn net.Conn
+	// idleConn is the idle-timeout wrapper the codecs read and write through, or nil when no timeout is
+	// set. Close marks it closing so that its per-call deadline refreshes cannot outlive the close poke.
+	// It is set at construction and never modified, so it is read without a lock.
+	idleConn *idleTimeoutConn
+
+	audioReadResultChannelPool sync.Pool
+
+	// The following fields are owned by the session goroutine; no lock guards them.
+	enc *vmprotocol.Encoder
+	dec *vmprotocol.Decoder
+	// renderer mirrors the guest's images. Close disposes it after the goroutine has joined, and
+	// finishFrame publishes its screen into compositableFrame under mu.
+	renderer          *frameRenderer
+	nextReadbackID    uint64
+	readbacks         map[uint64]*asyncPixelReadback
+	readbackPixelsBuf []byte
+	// audioReadPCM and audioReadEOF capture the answer to the in-flight HostMessageKindReadAudio while
+	// sendAndReceive runs; runReadAudio hands them to the waiting reader.
+	audioReadPCM []byte
+	audioReadEOF bool
+	// textInput is the guest's active text-input session, or nil.
+	textInput *GuestTextInput
+
+	// The following fields are owned by the host goroutine; no lock guards them.
+	outsideScreen     *ebiten.Image
+	sentOutsideWidth  float64
+	sentOutsideHeight float64
+	sentScreenWidth   int
+	sentScreenHeight  int
+	compositor        frameCompositor
+
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	// The following fields are guarded by mu.
+	//
+	// ops is the ordered request queue (ticks coalesced into a count, plus input and size messages),
+	// drained by the session goroutine in submission order.
+	ops []op
+	// pendingReadPixels is the guest read-back the session goroutine is parked on, waiting for a host
+	// call within the host's frame to perform it; nil when none is in flight.
+	pendingReadPixels *readPixelsRequest
+	// hostWaiters counts blocked tick and frame waits.
+	hostWaiters int
+	// submittedTicks and consumedTicks count ticks requested and processed; their difference is the
+	// backlog. They only increase. submittedTicks is touched only by the host goroutine, but it lives
+	// here because WaitTicks compares it against consumedTicks, which the session writes.
+	submittedTicks int64
+	consumedTicks  int64
+	// requestedFrameSeq increments on each AdvanceFrame, so coalesced requests collapse to the latest
+	// value. renderedFrameSeq is the request the most recently completed frame satisfies; a
+	// frame is owed while requestedFrameSeq exceeds it, and it doubles as the consumed marker once the
+	// frame is composited. WaitFrame compares a snapshot of requestedFrameSeq against renderedFrameSeq so
+	// it resolves to a specific requested frame rather than any newer one.
+	requestedFrameSeq int64
+	renderedFrameSeq  int64
+	// framePhase is the lifecycle of the single in-progress frame; the session does not render a new one
+	// until the host has composited the last (back to framePhaseRenderable).
+	framePhase framePhase
+	// compositableFrame is the mirror screen handed to the host to composite while framePhase is
+	// framePhaseCompositable.
+	compositableFrame hostImage
+	// requestedTPS is the guest game's most recently reported requested TPS. It starts at the standard
+	// default and the guest updates it whenever its game changes the value.
+	requestedTPS int
+	// cursorShape is the guest game's most recently reported cursor shape. It starts at the default
+	// shape and the guest updates it whenever its game changes the value.
+	cursorShape ebiten.CursorShapeType
+	// pendingEvents holds the guest events (vibrations, new audio streams) awaiting handler delivery, in
+	// arrival order. The session goroutine appends them and dispatchPendingEvents drains them on the
+	// goroutine calling AdvanceTicks or WaitTicks. Events for a nil handler are never queued, so the queue
+	// only grows while requested ticks produce events for a registered handler.
+	pendingEvents []guestEvent
+	// pendingEventsBuf is the spare buffer dispatchPendingEvents swaps in for pendingEvents, so
+	// steady-state dispatch alternates between the two slices' storage instead of allocating.
+	pendingEventsBuf []guestEvent
+	// msgPool is a free list backing the queued host messages: a sender takes one through
+	// takeMessageLocked and the session goroutine returns it once it is encoded, so steady-state input
+	// forwarding allocates nothing. Pooled messages are reset, with their buffers' capacity kept for
+	// reuse.
+	msgPool []*vmprotocol.HostMessage
+	// err holds the error(s) that ended the session, joined as they occur; closed is set by Close.
+	err    error
+	closed bool
+
+	// done is closed when the session goroutine exits; Close waits on it. closeOnce and closeErr make
+	// Close idempotent.
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
+
+	// audioMu guards the audio player map and the reported sample rate. Each GuestAudioStream guards its
+	// own fields with its own lock, so reads of one player neither block the map operations nor the other
+	// players. These have a separate lock from mu because the host reads players from an arbitrary
+	// goroutine (an audio player's source), independently of the host's frame-bound work under mu.
+	audioMu         sync.Mutex
+	audioStreams    map[int64]*GuestAudioStream
+	audioSampleRate int
+
+	// onGamepadVibration, if non-nil, is called for each vibration the guest requests. It is set at
+	// construction and never modified, so it is read without a lock.
+	onGamepadVibration func(GuestGamepadVibration)
+
+	// onVibration, if non-nil, is called for each device vibration the guest requests. Like
+	// onGamepadVibration, it is set at construction and never modified.
+	onVibration func(GuestVibration)
+
+	// onAudioStream, if non-nil, is called for each new audio stream the guest starts. Like
+	// onGamepadVibration it is set at construction and never modified, so it is read without a lock.
+	onAudioStream func(*GuestAudioStream)
+
+	// onTextInput, if non-nil, is called for each text-input session the guest's game starts. Like
+	// onGamepadVibration it is set at construction and never modified, so it is read without a lock.
+	onTextInput func(*GuestTextInput)
+}
+
+// opKind discriminates an operation the session goroutine performs.
+type opKind int
+
+const (
+	// opTick is a run of tick requests, count in op.count.
+	opTick opKind = iota
+	// opMessage is a single host message (input or outside size), in op.msg.
+	opMessage
+	// opFrame renders a frame. It is never queued; nextOp derives it from a pending frame request.
+	opFrame
+	// opReadAudio reads one audio player's samples; the result goes to op.audioResp.
+	opReadAudio
+)
+
+type op struct {
+	kind  opKind
+	count int
+	msg   *vmprotocol.HostMessage
+	// seq is the frame request an opFrame satisfies; it labels the rendered frame for WaitFrame.
+	seq int64
+	// audioID and audioMaxLenInBytes parameterize an opReadAudio; audioResp receives its result.
+	audioID            int64
+	audioMaxLenInBytes int
+	audioResp          chan audioReadResult
+}
+
+// readPixelsRequest is one guest read-back the session goroutine has prepared and handed to the host,
+// which starts or polls it from within the host's frame.
+type readPixelsRequest struct {
+	img     *ui.Image
+	regions []image.Rectangle
+
+	// done reports that the host has served the request. It is guarded by GuestSession.mu.
+	done bool
+
+	readback *asyncPixelReadback
+
+	// poll reports whether the host should submit commands and poll pending read-backs.
+	poll bool
+
+	// wait holds the read-backs the host should submit and complete.
+	wait []*graphicscommand.PixelReadback
+}
+
+type asyncPixelReadback struct {
+	buffer  []byte
+	pixels  [][]byte
+	results []*graphicscommand.PixelReadback
+}
+
+// guestEventKind discriminates a guest event queued for handler delivery.
+type guestEventKind int
+
+const (
+	guestEventGamepadVibration guestEventKind = iota
+	guestEventVibration
+	guestEventAudioStream
+	guestEventTextInput
+)
+
+// guestEvent is one guest-originated event awaiting its handler; the field its kind selects carries the
+// payload.
+type guestEvent struct {
+	kind             guestEventKind
+	gamepadVibration GuestGamepadVibration
+	vibration        GuestVibration
+	audioStream      *GuestAudioStream
+	textInput        *GuestTextInput
+}
+
+// framePhase tracks which side may touch the screen mirror as the single in-progress frame moves from
+// render to composite. The phases are exclusive, so the host never composites the mirror while the
+// session is rendering into it.
+type framePhase int
+
+const (
+	// framePhaseRenderable: the mirror is open for the session to render the next frame into; the host
+	// must not composite it.
+	framePhaseRenderable framePhase = iota
+	// framePhaseRendering: the session is rendering into the mirror; the host must not composite it.
+	framePhaseRendering
+	// framePhaseCompositable: the mirror holds a completed frame for the host to composite; the session
+	// must not render into it.
+	framePhaseCompositable
+)
+
+// NewGuestSessionOptions represents options for [NewGuestSession].
+type NewGuestSessionOptions struct {
+	// IdleTimeout is the maximum duration the connection may make no progress while an operation
+	// (including the handshake) is in progress: when it elapses, the operation fails with an error
+	// matching [os.ErrDeadlineExceeded], the error surfaces from [GuestSession.Err], and the session is
+	// unusable except for [GuestSession.Close]. It bounds silence, not an operation's total duration: a
+	// guest that keeps sending never times out. The default (0) means no timeout.
+	IdleTimeout time.Duration
+
+	// OnGamepadVibration, if non-nil, is called for each gamepad vibration the guest's game requests. It
+	// runs during [GuestSession.AdvanceTicks] and [GuestSession.WaitTicks], on the calling goroutine; a
+	// host typically just calls [ebiten.VibrateGamepad]. A nil handler discards the guest's vibrations.
+	OnGamepadVibration func(GuestGamepadVibration)
+
+	// OnVibration, if non-nil, is called for each device vibration the guest's game requests. It runs
+	// during [GuestSession.AdvanceTicks] and [GuestSession.WaitTicks], on the calling goroutine; a host
+	// typically just calls [ebiten.Vibrate]. A nil handler discards the guest's vibrations.
+	OnVibration func(GuestVibration)
+
+	// OnAudioStream, if non-nil, is called once for each new audio stream the guest starts, handed the
+	// persistent [GuestAudioStream] to read and inspect. It runs during [GuestSession.AdvanceTicks] and
+	// [GuestSession.WaitTicks], on the calling goroutine; a host typically uses the stream as the source
+	// of an audio player. A nil handler discards the guest's audio.
+	OnAudioStream func(*GuestAudioStream)
+
+	// OnTextInput, if non-nil, is called once for each text-input session the guest's game starts,
+	// handed the [GuestTextInput] to serve as the guest's IME. It runs during
+	// [GuestSession.AdvanceTicks] and [GuestSession.WaitTicks], on the calling goroutine. With a nil
+	// handler a session starts and never receives a state, like a platform without IME support.
+	OnTextInput func(*GuestTextInput)
+}
+
+// NewGuestSession opens a session with a guest process over an established connection.
+// It returns an error if the protocol handshake fails, including a protocol version mismatch,
+// or if single-thread mode is already selected by [ebiten.RunGameWithOptions] or a build tag.
+// options can be nil, which means the default options.
+func NewGuestSession(conn net.Conn, options *NewGuestSessionOptions) (*GuestSession, error) {
+	if err := ui.RegisterVMHost(); err != nil {
+		return nil, err
+	}
+	var sessionCreated bool
+	defer func() {
+		if !sessionCreated {
+			ui.UnregisterVMHost()
+		}
+	}()
+	var idleConn *idleTimeoutConn
+	var rw io.ReadWriter = conn
+	if options != nil && options.IdleTimeout > 0 {
+		idleConn = &idleTimeoutConn{
+			conn:        conn,
+			idleTimeout: options.IdleTimeout,
+		}
+		rw = idleConn
+	}
+	// The handshake runs before the connection is wrapped in gob codecs (the host is the initiator).
+	if err := vmprotocol.PerformHandshake(rw, true); err != nil {
+		return nil, fmt.Errorf("vmhost: the handshake with the guest failed: %w", err)
+	}
+	g := &GuestSession{
+		conn:         conn,
+		idleConn:     idleConn,
+		enc:          vmprotocol.NewEncoder(rw),
+		dec:          vmprotocol.NewDecoder(rw),
+		renderer:     newFrameRenderer(),
+		done:         make(chan struct{}),
+		audioStreams: map[int64]*GuestAudioStream{},
+		// The guest reports its requested TPS only when it changes; until then it runs at the standard
+		// default, so report that rather than a meaningless zero.
+		requestedTPS: clock.DefaultTPS,
+		audioReadResultChannelPool: sync.Pool{
+			New: func() any { return make(chan audioReadResult, 1) },
+		},
+	}
+	if options != nil {
+		// Set before the session goroutine starts, so they are read without a lock.
+		g.onGamepadVibration = options.OnGamepadVibration
+		g.onVibration = options.OnVibration
+		g.onAudioStream = options.OnAudioStream
+		g.onTextInput = options.OnTextInput
+	}
+	g.cond = sync.NewCond(&g.mu)
+	go g.sessionLoop()
+	sessionCreated = true
+	return g, nil
+}
+
+// idleTimeoutConn bounds each Read and Write with a deadline refreshed at every call, so the timeout
+// limits silence on the connection rather than an operation's total duration.
+type idleTimeoutConn struct {
+	conn        net.Conn
+	idleTimeout time.Duration
+
+	// mu guards closing and serializes the refreshes against markClosing, so a refresh either completes
+	// before the close poke or observes that the connection is closing.
+	mu      sync.Mutex
+	closing bool
+}
+
+func (c *idleTimeoutConn) Read(p []byte) (int, error) {
+	if err := c.refreshReadDeadline(); err != nil {
+		return 0, err
+	}
+	return c.conn.Read(p)
+}
+
+func (c *idleTimeoutConn) Write(p []byte) (int, error) {
+	if err := c.refreshWriteDeadline(); err != nil {
+		return 0, err
+	}
+	return c.conn.Write(p)
+}
+
+// refreshReadDeadline sets the deadline for the read about to run.
+func (c *idleTimeoutConn) refreshReadDeadline() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.SetReadDeadline(c.nextDeadlineLocked())
+}
+
+// refreshWriteDeadline sets the deadline for the write about to run.
+func (c *idleTimeoutConn) refreshWriteDeadline() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.SetWriteDeadline(c.nextDeadlineLocked())
+}
+
+// nextDeadlineLocked returns the deadline the operation about to run gets: its idle timeout, or an
+// expired one once the connection is closing, so that the operation fails at once. c.mu must be held,
+// and the deadline must be set under that same lock, so that a refresh and the close poke cannot
+// interleave.
+func (c *idleTimeoutConn) nextDeadlineLocked() time.Time {
+	if c.closing {
+		return time.Now()
+	}
+	return time.Now().Add(c.idleTimeout)
+}
+
+// markClosing expires the connection's deadlines for good: an in-flight Read or Write fails at once,
+// and no later one waits.
+func (c *idleTimeoutConn) markClosing() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closing = true
+	return c.conn.SetDeadline(time.Now())
+}
+
+// sessionLoop owns the connection: it repeatedly takes the next task, runs it without the lock, and
+// records the result. All access to the shared state is confined to the helper methods it calls, each
+// of which holds the lock for its own scope.
+func (g *GuestSession) sessionLoop() {
+	defer close(g.done)
+	// Release audio reads still queued at shutdown; a read already in flight is released by runReadAudio.
+	defer g.drainQueuedReads()
+	// Guest input and audio streams do not outlive the guest session. Close them
+	// here so their holders can observe the end through IsClosed.
+	defer func() {
+		if g.textInput != nil {
+			g.textInput.markClosed()
+		}
+		g.audioMu.Lock()
+		defer g.audioMu.Unlock()
+		for _, stream := range g.audioStreams {
+			stream.markClosed()
+		}
+		clear(g.audioStreams)
+	}()
+	for {
+		o, ok := g.nextOp()
+		if !ok {
+			return
+		}
+		var err error
+		switch o.kind {
+		case opTick, opMessage:
+			// A successful tick or message needs no completion step: consumeTick already wakes WaitTicks
+			// per tick, and a message changes nothing a waiter observes.
+			err = g.runOp(o)
+		case opReadAudio:
+			err = g.runReadAudio(o)
+		case opFrame:
+			if err = g.sendAndReceive(&vmprotocol.HostMessage{
+				Kind: vmprotocol.HostMessageKindAdvanceFrame,
+			}); err == nil {
+				err = g.finishFrame(o.seq)
+			}
+		}
+		if err != nil {
+			g.fail(err)
+			return
+		}
+	}
+}
+
+// nextOp blocks until there is work, then returns the next operation; ok is false when the session
+// should stop. Queued operations are drained before a frame is rendered, so a frame always reflects
+// every request submitted before it.
+func (g *GuestSession) nextOp() (op, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for {
+		if g.closed || g.err != nil {
+			return op{}, false
+		}
+		if len(g.ops) > 0 {
+			o := g.ops[0]
+			g.ops[0] = op{}
+			g.ops = g.ops[1:]
+			return o, true
+		}
+		if g.requestedFrameSeq > g.renderedFrameSeq && g.consumedTicks > 0 && g.framePhase == framePhaseRenderable {
+			// A frame is owed, the queue is drained, and the mirror is free. The frame satisfies every
+			// request up to the latest, so it carries the current requestedFrameSeq.
+			g.framePhase = framePhaseRendering
+			return op{kind: opFrame, seq: g.requestedFrameSeq}, true
+		}
+		// Nothing is actionable yet; wait for the next state change.
+		g.cond.Wait()
+	}
+}
+
+// fail records an error that ends the session and wakes any waiters.
+func (g *GuestSession) fail(err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.setErrLocked(err)
+}
+
+// finishFrame publishes the just-rendered mirror screen for the host to composite and wakes a waiting
+// WaitFrame. It returns an error if the guest produced no screen.
+func (g *GuestSession) finishFrame(seq int64) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.renderer.screen == nil {
+		g.framePhase = framePhaseRenderable
+		return errors.New("vmhost: no screen framebuffer was produced")
+	}
+	g.compositableFrame = *g.renderer.screen
+	g.renderedFrameSeq = seq
+	g.framePhase = framePhaseCompositable
+	g.cond.Broadcast()
+	return nil
+}
+
+// runOp performs one queued operation: a run of ticks or a single host message. It must be called
+// without g.mu held.
+func (g *GuestSession) runOp(o op) error {
+	switch o.kind {
+	case opTick:
+		for range o.count {
+			if err := g.sendAndReceive(&vmprotocol.HostMessage{
+				Kind: vmprotocol.HostMessageKindAdvanceTick,
+			}); err != nil {
+				return err
+			}
+			g.consumeTick()
+		}
+		return nil
+	case opMessage:
+		err := g.sendAndReceive(o.msg)
+		g.recycleMessage(o.msg)
+		return err
+	}
+	return nil
+}
+
+// consumeTick records that one tick has been processed.
+func (g *GuestSession) consumeTick() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.consumedTicks++
+	g.cond.Broadcast()
+}
+
+// sendAndReceive sends one operation and reads the guest's messages until its concluding one,
+// rendering command batches and answering queries in between. It must be called without g.mu held: the
+// renderer is the session goroutine's alone here.
+func (g *GuestSession) sendAndReceive(msg *vmprotocol.HostMessage) error {
+	if err := g.enc.EncodeHostMessage(msg); err != nil {
+		return err
+	}
+	for {
+		var gm vmprotocol.GuestMessage
+		if err := g.dec.DecodeGuestMessage(&gm); err != nil {
+			return err
+		}
+		// Serving these needs the host's graphics driver, which exists only while the host's game runs.
+		switch gm.Kind {
+		case vmprotocol.GuestMessageKindGraphicsCommands,
+			vmprotocol.GuestMessageKindQueryReadPixelsAsync,
+			vmprotocol.GuestMessageKindQueryMaxImageSize,
+			vmprotocol.GuestMessageKindQueryColorSpace:
+			if !ui.Get().IsRunning() {
+				return errors.New("vmhost: the host's game must be running before the guest can render or query it")
+			}
+		}
+		switch gm.Kind {
+		case vmprotocol.GuestMessageKindGraphicsCommands:
+			if err := g.renderer.render(gm.GraphicsCommands); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindQueryReadPixelsAsync:
+			if err := g.answerReadPixelsAsync(&gm); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindQueryPollReadPixels:
+			if err := g.answerPollReadPixels(gm.ReadbackID); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindQueryWaitReadPixels:
+			if err := g.answerWaitReadPixels(gm.ReadbackID); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindDisposeReadPixels:
+			g.disposeReadback(gm.ReadbackID)
+			continue
+		case vmprotocol.GuestMessageKindQueryMaxImageSize:
+			if err := g.answerMaxImageSize(); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindQueryDeviceScaleFactor:
+			if err := g.answerDeviceScaleFactor(); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindQueryColorSpace:
+			if err := g.answerColorSpace(); err != nil {
+				return err
+			}
+			continue
+		case vmprotocol.GuestMessageKindAudioControl:
+			g.applyAudioControl(&gm)
+			continue
+		case vmprotocol.GuestMessageKindAudioData:
+			// gm is fresh each iteration, so AudioPCM is a newly allocated slice no later decode
+			// overwrites, and the waiting Read copies it out before the next read; aliasing it directly
+			// needs no copy.
+			g.audioReadPCM = gm.AudioPCM
+			g.audioReadEOF = gm.AudioEOF
+			continue
+		case vmprotocol.GuestMessageKindRequestedTPS:
+			g.setRequestedTPS(gm.RequestedTPS)
+			continue
+		case vmprotocol.GuestMessageKindCursorShape:
+			g.setCursorShape(ebiten.CursorShapeType(gm.CursorShape))
+			continue
+		case vmprotocol.GuestMessageKindGamepadVibrations:
+			g.queueGamepadVibrations(&gm)
+			continue
+		case vmprotocol.GuestMessageKindVibration:
+			g.queueVibration(&gm)
+			continue
+		case vmprotocol.GuestMessageKindTextInput:
+			g.handleTextInput(&gm)
+			continue
+		case vmprotocol.GuestMessageKindTextInputEnd:
+			g.handleTextInputEnd(&gm)
+			continue
+		case vmprotocol.GuestMessageKindDone:
+			if gm.Terminated {
+				return ebiten.Termination
+			}
+			if gm.Err != "" {
+				return errors.New(gm.Err)
+			}
+			return nil
+		default:
+			return fmt.Errorf("vmhost: unknown guest message kind %d", gm.Kind)
+		}
+	}
+}
+
+func (g *GuestSession) validateReadPixels(query *vmprotocol.GuestMessage) (*hostImage, int64, error) {
+	mirror, ok := g.renderer.images[query.ReadImageID]
+	if !ok {
+		return nil, 0, fmt.Errorf("vmhost: ReadPixels references unknown image %d", query.ReadImageID)
+	}
+	bounds := image.Rect(0, 0, mirror.width, mirror.height)
+	var total int64
+	for _, r := range query.ReadRegions {
+		if r.Empty() || !r.In(bounds) {
+			return nil, 0, fmt.Errorf("vmhost: ReadPixels region %v is not within image %d's bounds %v", r, query.ReadImageID, bounds)
+		}
+		total += 4 * int64(r.Dx()) * int64(r.Dy())
+	}
+	// A read-back cannot need more than the image holds, which bounds the buffer a guest can make the
+	// host allocate.
+	if maxTotal := 4 * int64(bounds.Dx()) * int64(bounds.Dy()); total > maxTotal {
+		return nil, 0, fmt.Errorf("vmhost: ReadPixels asks for %d bytes from image %d, which holds %d",
+			total, query.ReadImageID, maxTotal)
+	}
+	return mirror, total, nil
+}
+
+func (g *GuestSession) answerReadPixelsAsync(query *vmprotocol.GuestMessage) error {
+	answer := vmprotocol.HostMessage{
+		Kind: vmprotocol.HostMessageKindAnswerReadPixelsAsync,
+	}
+	id, err := g.startReadPixelsAsync(query)
+	if err != nil {
+		answer.Err = err.Error()
+	} else {
+		answer.ReadbackID = id
+	}
+	return g.enc.EncodeHostMessage(&answer)
+}
+
+func (g *GuestSession) startReadPixelsAsync(query *vmprotocol.GuestMessage) (uint64, error) {
+	mirror, total, err := g.validateReadPixels(query)
+	if err != nil {
+		return 0, err
+	}
+	pixels := slices.Grow(g.readbackPixelsBuf[:0], int(total))[:int(total)]
+	g.readbackPixelsBuf = nil
+	readback := &asyncPixelReadback{
+		buffer:  pixels,
+		pixels:  make([][]byte, len(query.ReadRegions)),
+		results: make([]*graphicscommand.PixelReadback, len(query.ReadRegions)),
+	}
+	var off int
+	for j, region := range query.ReadRegions {
+		n := 4 * region.Dx() * region.Dy()
+		readback.pixels[j] = pixels[off : off+n]
+		off += n
+	}
+	if err := g.requestReadPixelsInHostFrame(&readPixelsRequest{
+		img:      mirror.img,
+		regions:  query.ReadRegions,
+		readback: readback,
+	}); err != nil {
+		return 0, err
+	}
+	g.nextReadbackID++
+	if g.readbacks == nil {
+		g.readbacks = map[uint64]*asyncPixelReadback{}
+	}
+	g.readbacks[g.nextReadbackID] = readback
+	return g.nextReadbackID, nil
+}
+
+func (g *GuestSession) disposeReadback(id uint64) {
+	readback, ok := g.readbacks[id]
+	if !ok {
+		return
+	}
+	delete(g.readbacks, id)
+	// The host's command queue owns the buffers until every region has completed, even on error.
+	for _, result := range readback.results {
+		if done, _ := result.Poll(); !done {
+			return
+		}
+	}
+	// Retain at most one buffer, as synchronous reads normally release before starting the next.
+	if cap(readback.buffer) > cap(g.readbackPixelsBuf) {
+		g.readbackPixelsBuf = readback.buffer[:0]
+	}
+}
+
+func (g *GuestSession) answerPollReadPixels(id uint64) error {
+	answer := vmprotocol.HostMessage{
+		Kind: vmprotocol.HostMessageKindAnswerReadPixelsAsync,
+	}
+	readback, ok := g.readbacks[id]
+	if !ok {
+		answer.Err = fmt.Sprintf("vmhost: unknown read-back %d", id)
+		return g.enc.EncodeHostMessage(&answer)
+	}
+	// Polling only requests a GPU completion check if the render loop can accept it immediately.
+	// Waiting for that loop could block the session indefinitely after shutdown or while mobile
+	// rendering is suspended. A later guest poll or host frame can retry if the loop is unavailable.
+	done, err := readback.tryPoll()
+	// A waiting host can also submit commands that have not reached a frame flush yet.
+	if !done && err == nil && g.hostIsWaiting() {
+		if err := g.requestReadPixelsInHostFrame(&readPixelsRequest{
+			poll: true,
+		}); err != nil {
+			answer.Err = err.Error()
+			return g.enc.EncodeHostMessage(&answer)
+		}
+		done, err = readback.completion()
+	}
+	answer.ReadbackDone = done
+	if err != nil {
+		answer.Err = err.Error()
+	} else if done {
+		answer.Pixels = readback.pixels
+	}
+	return g.enc.EncodeHostMessage(&answer)
+}
+
+func (g *GuestSession) answerWaitReadPixels(id uint64) error {
+	answer := vmprotocol.HostMessage{
+		Kind: vmprotocol.HostMessageKindAnswerReadPixelsAsync,
+	}
+	readback, ok := g.readbacks[id]
+	if !ok {
+		answer.Err = fmt.Sprintf("vmhost: unknown read-back %d", id)
+		return g.enc.EncodeHostMessage(&answer)
+	}
+	if err := g.waitReadPixels(readback); err != nil {
+		answer.Err = err.Error()
+	} else {
+		answer.ReadbackDone = true
+		answer.Pixels = readback.pixels
+	}
+	return g.enc.EncodeHostMessage(&answer)
+}
+
+func (g *GuestSession) waitReadPixels(readback *asyncPixelReadback) error {
+	for {
+		if done, err := readback.completion(); done || err != nil {
+			return err
+		}
+		if err := g.readbackWaitError(); err != nil {
+			return err
+		}
+		if g.hostIsWaiting() {
+			if err := g.requestReadPixelsInHostFrame(&readPixelsRequest{
+				wait: readback.results,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if done, err := readback.tryPoll(); done || err != nil {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (g *GuestSession) readbackWaitError() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return errReadPixelsAbandoned
+	}
+	return nil
+}
+
+func (r *asyncPixelReadback) tryPoll() (bool, error) {
+	if done, err := r.completion(); done || err != nil {
+		return done, err
+	}
+	// Submission belongs to the host's frame. Completion can advance between frames.
+	ui.Get().TryPollPixelReadbacks()
+	return r.completion()
+}
+
+func (r *asyncPixelReadback) completion() (bool, error) {
+	complete := true
+	for _, result := range r.results {
+		done, err := result.Poll()
+		if err != nil {
+			return false, err
+		}
+		if !done {
+			complete = false
+		}
+	}
+	return complete, nil
+}
+
+// hostIsWaiting reports whether a host tick or frame wait is blocked.
+func (g *GuestSession) hostIsWaiting() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.hostWaiters != 0
+}
+
+// errReadPixelsAbandoned ends a guest read-back no host will ever perform because the session is over.
+var errReadPixelsAbandoned = errors.New("vmhost: the session ended before the guest's read-back")
+
+func (g *GuestSession) requestReadPixelsInHostFrame(req *readPixelsRequest) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return errReadPixelsAbandoned
+	}
+	g.pendingReadPixels = req
+	g.cond.Broadcast()
+	for !req.done {
+		// A request no host has taken yet is dropped once the session ends, so a close never waits on a
+		// read-back. A taken one is being filled right now and is waited out.
+		if (g.closed || g.err != nil) && g.pendingReadPixels == req {
+			g.pendingReadPixels = nil
+			return errReadPixelsAbandoned
+		}
+		g.cond.Wait()
+	}
+	return nil
+}
+
+// servePendingReadPixels performs the read-back the session goroutine is parked on, if any, and wakes
+// it. It must be called from within the host's frame.
+func (g *GuestSession) servePendingReadPixels() {
+	req := g.takePendingReadPixels()
+	if req == nil {
+		return
+	}
+	// A guest can wait inside a tick or frame while the host waits for that same operation.
+	// Advance its read-backs here so completion does not require another host frame.
+	if req.poll {
+		ui.Get().FlushAndPollPixelReadbacks()
+	}
+	if req.wait != nil {
+		// The session goroutine reads each result after this request completes.
+		_ = ui.Get().FlushAndWaitPixelReadbacks(req.wait)
+	}
+	for i, r := range req.regions {
+		req.readback.results[i] = req.img.ReadPixelsAsync(req.readback.pixels[i], r)
+	}
+	g.finishReadPixels(req)
+}
+
+// takePendingReadPixels claims the pending read-back for the caller to perform, or returns nil when
+// there is none. The session goroutine stays parked on a claimed request until it is finished.
+func (g *GuestSession) takePendingReadPixels() *readPixelsRequest {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	req := g.pendingReadPixels
+	g.pendingReadPixels = nil
+	return req
+}
+
+// finishReadPixels wakes the session goroutine after a read-back is performed or enqueued.
+func (g *GuestSession) finishReadPixels(req *readPixelsRequest) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	req.done = true
+	g.cond.Broadcast()
+}
+
+// answerMaxImageSize answers with the host graphics driver's maximum image size.
+func (g *GuestSession) answerMaxImageSize() error {
+	return g.enc.EncodeHostMessage(&vmprotocol.HostMessage{
+		Kind:         vmprotocol.HostMessageKindAnswerMaxImageSize,
+		MaxImageSize: ui.Get().GraphicsMaxImageSize(),
+	})
+}
+
+// answerDeviceScaleFactor answers with the host's current device scale factor.
+func (g *GuestSession) answerDeviceScaleFactor() error {
+	return g.enc.EncodeHostMessage(&vmprotocol.HostMessage{
+		Kind:        vmprotocol.HostMessageKindAnswerDeviceScaleFactor,
+		ScaleFactor: hostDeviceScaleFactor(),
+	})
+}
+
+// hostDeviceScaleFactor returns the host's current device scale factor, defaulting to 1 when no monitor
+// is available (e.g. before the game starts).
+func hostDeviceScaleFactor() float64 {
+	if m := ebiten.Monitor(); m != nil {
+		return m.DeviceScaleFactor()
+	}
+	return 1
+}
+
+// answerColorSpace answers with the host graphics driver's color space.
+func (g *GuestSession) answerColorSpace() error {
+	return g.enc.EncodeHostMessage(&vmprotocol.HostMessage{
+		Kind:       vmprotocol.HostMessageKindAnswerColorSpace,
+		ColorSpace: ui.Get().GraphicsColorSpace(),
+	})
+}
+
+// setErrLocked records an error that ends the session, joined with any already recorded, and wakes
+// any waiters. g.mu must be held.
+func (g *GuestSession) setErrLocked(err error) {
+	g.err = errors.Join(g.err, err)
+	g.cond.Broadcast()
+}
+
+// SetOutsideScreen sets the host-owned image the guest's frames composite into, and sizes the guest to
+// it: the image is in device-dependent pixels, that is, the guest's outside size in
+// device-independent pixels multiplied by the host's device scale factor
+// ([ebiten.MonitorType.DeviceScaleFactor]). The image must not be nil. SetOutsideScreen must be
+// called before the first [GuestSession.AdvanceTicks], and again when the host replaces its screen
+// (e.g. on a resize).
+func (g *GuestSession) SetOutsideScreen(screen *ebiten.Image) error {
+	if screen == nil {
+		return errors.New("vmhost: SetOutsideScreen requires a non-nil screen")
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return nil
+	}
+	g.outsideScreen = screen
+
+	// The outside size is the screen's size divided by the host's device scale factor. The scale
+	// itself is not sent: the guest pulls it from the host per tick and renders at the screen's full
+	// device-dependent resolution. The screen's size in pixels is sent alongside, as the guest must
+	// render into an image of exactly that size for CompositeFrame to accept the frame.
+	scale := hostDeviceScaleFactor()
+	b := screen.Bounds()
+	pw, ph := b.Dx(), b.Dy()
+	w := float64(pw) / scale
+	h := float64(ph) / scale
+	if w == g.sentOutsideWidth && h == g.sentOutsideHeight && pw == g.sentScreenWidth && ph == g.sentScreenHeight {
+		return nil
+	}
+	g.sentOutsideWidth = w
+	g.sentOutsideHeight = h
+	g.sentScreenWidth = pw
+	g.sentScreenHeight = ph
+	msg := g.takeMessageLocked()
+	msg.Kind = vmprotocol.HostMessageKindSetOutsideSize
+	msg.OutsideWidth = w
+	msg.OutsideHeight = h
+	msg.ScreenWidth = pw
+	msg.ScreenHeight = ph
+	g.queueOpLocked(op{
+		kind: opMessage,
+		msg:  msg,
+	})
+	return nil
+}
+
+// AdvanceTicks requests n Updates on the guest. It does not block on the guest: the requests are queued
+// and processed by the session goroutine. n must not be negative; a zero count requests nothing.
+//
+// Before returning it delivers the guest events processed ticks have produced (vibrations, new audio
+// streams, and new text-input sessions) to the [NewGuestSessionOptions] handlers, on the calling
+// goroutine.
+//
+// A regular termination, a timeout, and any deferred error surface from [GuestSession.Err]; the number
+// of requested-but-unprocessed ticks is reported by [GuestSession.PendingTicks].
+func (g *GuestSession) AdvanceTicks(n int) {
+	if n < 0 {
+		panic("vmhost: negative AdvanceTicks count")
+	}
+	g.queueTicks(n)
+	g.dispatchPendingEvents()
+}
+
+// queueTicks queues n tick requests for the session goroutine.
+func (g *GuestSession) queueTicks(n int) {
+	if n == 0 {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// Ticks requested on an ended session still count as requested, so that WaitTicks reports them as
+	// unprocessed.
+	g.submittedTicks += int64(n)
+	if g.closed || g.err != nil {
+		return
+	}
+	if g.outsideScreen == nil {
+		g.setErrLocked(errors.New("vmhost: SetOutsideScreen must be called at least once before AdvanceTicks"))
+		return
+	}
+	// Coalesce consecutive ticks into a single counted entry.
+	if k := len(g.ops); k > 0 && g.ops[k-1].kind == opTick {
+		g.ops[k-1].count += n
+	} else {
+		g.ops = append(g.ops, op{kind: opTick, count: n})
+	}
+	g.cond.Broadcast()
+}
+
+// AdvanceFrame requests the guest's next frame. It does not block: the frame is rendered by the session
+// goroutine and presented later by [GuestSession.CompositeFrame], optionally after blocking for it with
+// [GuestSession.WaitFrame]. Without that wait, CompositeFrame likely presents a previously requested
+// frame, since the one just requested has yet to render. At most one frame is in flight: requests made
+// before the last is composited by CompositeFrame coalesce into one. A regular termination, a timeout,
+// and any deferred error surface from [GuestSession.Err].
+func (g *GuestSession) AdvanceFrame() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return
+	}
+	// A frame can only be produced after the first tick.
+	if g.submittedTicks > 0 {
+		g.requestedFrameSeq++
+		g.cond.Broadcast()
+	}
+}
+
+// WaitFrame blocks until the frame requested by a preceding [GuestSession.AdvanceFrame] has been
+// rendered, leaving it for [GuestSession.CompositeFrame] to present. Inserted between them it makes
+// capture deterministic: AdvanceTicks, AdvanceFrame, WaitFrame, CompositeFrame leaves the outside screen
+// reflecting the ticks. The wait resolves to the most recent frame requested as of the call: an earlier
+// completed frame still awaiting compositing is dropped rather than returned, while a frame requested
+// concurrently afterward does not extend the wait. It reports whether a frame is ready; it returns false
+// when no frame was requested (no preceding AdvanceFrame) or the session has ended (see
+// [GuestSession.Err]). It must not be called concurrently with [GuestSession.CompositeFrame].
+func (g *GuestSession) WaitFrame() bool {
+	want, wait := g.frameWaitTarget()
+	if !wait {
+		return false
+	}
+	for {
+		done, ok := g.waitFrameStep(want)
+		if done {
+			return ok
+		}
+		g.servePendingReadPixels()
+	}
+}
+
+// frameWaitTarget returns the frame request a wait resolves against, and whether waiting is needed at
+// all. Requests arriving afterward do not move the target.
+func (g *GuestSession) frameWaitTarget() (want int64, wait bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return 0, false
+	}
+	want = g.requestedFrameSeq
+	// Nothing is on the way: the wanted frame has already been rendered and composited, and no newer one
+	// is owed.
+	if want <= g.renderedFrameSeq && g.framePhase == framePhaseRenderable {
+		return 0, false
+	}
+	return want, true
+}
+
+// waitFrameStep blocks until the frame labeled want has been rendered, the session ends, or the guest
+// asks for a read-back. done is false only in the last case, which the caller resolves by performing it.
+func (g *GuestSession) waitFrameStep(want int64) (done, ok bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for {
+		if g.closed || g.err != nil {
+			return true, false
+		}
+		if g.framePhase == framePhaseCompositable {
+			// The completed frame satisfies the request once it is at least as new as the wanted one.
+			if g.renderedFrameSeq >= want {
+				return true, true
+			}
+			// The completed frame predates the request and occupies the single mirror, blocking the session
+			// from rendering the request. Drop it (it was never composited) so the request can render. The
+			// next render carries a seq >= want, so the wait then resolves without chasing later requests.
+			g.framePhase = framePhaseRenderable
+			g.cond.Broadcast()
+		}
+		if g.pendingReadPixels != nil {
+			return false, false
+		}
+		g.hostWaiters++
+		g.cond.Wait()
+		g.hostWaiters--
+	}
+}
+
+// CompositeFrame composites the guest's most recently completed frame into the screen set by
+// [GuestSession.SetOutsideScreen], freeing the session to render the next. It reports whether the
+// outside screen advanced to a newly completed frame; it returns false when no newer frame is ready yet
+// (the screen keeps its previous content) or when the session has ended (see [GuestSession.Err]). It
+// must be called from within the host's frame.
+//
+// The frame replaces the outside screen's content rather than blending over it, so the outside screen
+// carries the guest screen's alpha.
+func (g *GuestSession) CompositeFrame() bool {
+	// Start queued read-backs even when the host does not wait for guest ticks or frames.
+	g.servePendingReadPixels()
+
+	frame := g.takeFrame()
+	if frame.img == nil {
+		return false
+	}
+	// The frame is taken; free the mirror for the next render whether it is presented or dropped.
+	defer g.markComposited()
+
+	// SetOutsideScreen can replace the screen from another goroutine. Use one snapshot
+	// for both the size check and the draw destination.
+	g.mu.Lock()
+	outsideScreen := g.outsideScreen
+	g.mu.Unlock()
+
+	// Drop the frame if its size no longer matches the outside screen (a resize happened after it was
+	// rendered).
+	b := outsideScreen.Bounds()
+	if frame.width != b.Dx() || frame.height != b.Dy() {
+		return false
+	}
+	// A disposed outside screen draws nothing.
+	return g.compositor.composite(outsideScreen, frame)
+}
+
+// frameCompositor copies a guest frame onto the outside screen.
+type frameCompositor struct {
+	// frame is the frame being composited, set only during composite.
+	frame  hostImage
+	vtxBuf []float32
+}
+
+// composite copies frame onto dst. It reports false if dst is disposed.
+func (c *frameCompositor) composite(dst *ebiten.Image, frame hostImage) bool {
+	c.frame = frame
+	defer func() {
+		c.frame = hostImage{}
+	}()
+	return ui.DrawOnEbitenImage(dst, c)
+}
+
+// DrawOnImage implements [ui.EbitenImageDrawer].
+func (c *frameCompositor) DrawOnImage(dst *ui.Image, dstRegion image.Rectangle) {
+	n := 4 * graphics.VertexFloatCount
+	c.vtxBuf = slices.Grow(c.vtxBuf[:0], n)[:n]
+	graphics.QuadVerticesFromDstAndSrc(c.vtxBuf,
+		float32(dstRegion.Min.X), float32(dstRegion.Min.Y), float32(dstRegion.Max.X), float32(dstRegion.Max.Y),
+		0, 0, float32(c.frame.width), float32(c.frame.height), 1, 1, 1, 1)
+	srcs := [graphics.ShaderSrcImageCount]*ui.Image{c.frame.img}
+	srcRegions := [graphics.ShaderSrcImageCount]image.Rectangle{image.Rect(0, 0, c.frame.width, c.frame.height)}
+	dst.DrawTriangles(srcs, c.vtxBuf, graphics.QuadIndices(), graphicsdriver.BlendCopy, dstRegion, srcRegions, ui.NearestFilterShader, nil, true)
+}
+
+// takeFrame returns the completed frame for the host to composite, or the zero value (nil img) when
+// none is ready.
+func (g *GuestSession) takeFrame() hostImage {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return hostImage{}
+	}
+	if g.framePhase != framePhaseCompositable {
+		return hostImage{}
+	}
+	return g.compositableFrame
+}
+
+// markComposited records that the host has consumed the ready frame, freeing the mirror for the session
+// to render the next.
+func (g *GuestSession) markComposited() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.framePhase = framePhaseRenderable
+	g.cond.Broadcast()
+}
+
+// WaitTicks blocks until the guest has processed every tick requested so far. It reports whether all
+// were processed; it returns false when the session ended first (see [GuestSession.Err]).
+//
+// Before returning it delivers the guest events the ticks produced (vibrations, new audio streams,
+// and new text-input sessions) to the [NewGuestSessionOptions] handlers, on the calling goroutine.
+func (g *GuestSession) WaitTicks() bool {
+	ok := g.waitTicks()
+	g.dispatchPendingEvents()
+	return ok
+}
+
+// waitTicks blocks until the guest has processed every tick requested so far, or the session ends
+// first. It performs the guest's read-backs while it waits, as they need the host's frame this call
+// occupies.
+func (g *GuestSession) waitTicks() bool {
+	target := g.submittedTickTarget()
+	for {
+		done, ok := g.waitTicksStep(target)
+		if done {
+			return ok
+		}
+		g.servePendingReadPixels()
+	}
+}
+
+// submittedTickTarget returns the number of ticks requested so far: the target a wait resolves against,
+// which ticks requested afterward do not move.
+func (g *GuestSession) submittedTickTarget() int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.submittedTicks
+}
+
+// waitTicksStep blocks until the guest has processed target ticks, the session ends, or the guest asks
+// for a read-back. done is false only in the last case, which the caller resolves by performing it.
+func (g *GuestSession) waitTicksStep(target int64) (done, ok bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for g.consumedTicks < target {
+		if g.closed || g.err != nil {
+			return true, false
+		}
+		if g.pendingReadPixels != nil {
+			return false, false
+		}
+		g.hostWaiters++
+		g.cond.Wait()
+		g.hostWaiters--
+	}
+	return true, true
+}
+
+// PendingTicks returns the number of ticks requested but not yet processed by the guest.
+func (g *GuestSession) PendingTicks() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return int(g.submittedTicks - g.consumedTicks)
+}
+
+// ProcessedTicks returns the number of ticks the guest has processed so far.
+func (g *GuestSession) ProcessedTicks() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return int(g.consumedTicks)
+}
+
+// Err returns the error that ended the session, or nil if it is still running. It reports
+// [ebiten.Termination] (matchable with [errors.Is]) when the guest's Update signaled a regular
+// termination, a timeout (matchable with [os.ErrDeadlineExceeded]), or any deferred error. Once it is
+// non-nil the session is unusable except for [GuestSession.Close].
+func (g *GuestSession) Err() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.err
+}
+
+// PressKey injects a key-press event. key is an ebiten.Key.
+func (g *GuestSession) PressKey(key ebiten.Key) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindPressKey
+	msg.Code = int(key)
+	g.postMessage(msg)
+}
+
+// ReleaseKey injects a key-release event.
+func (g *GuestSession) ReleaseKey(key ebiten.Key) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindReleaseKey
+	msg.Code = int(key)
+	g.postMessage(msg)
+}
+
+// MoveCursor sets the cursor position in outside-screen device-independent pixels.
+func (g *GuestSession) MoveCursor(x, y float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindMoveCursor
+	msg.X = x
+	msg.Y = y
+	g.postMessage(msg)
+}
+
+// PressMouseButton injects a mouse-button-press event.
+func (g *GuestSession) PressMouseButton(button ebiten.MouseButton) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindPressMouseButton
+	msg.Code = int(button)
+	g.postMessage(msg)
+}
+
+// ReleaseMouseButton injects a mouse-button-release event.
+func (g *GuestSession) ReleaseMouseButton(button ebiten.MouseButton) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindReleaseMouseButton
+	msg.Code = int(button)
+	g.postMessage(msg)
+}
+
+// ScrollWheel injects a wheel movement.
+func (g *GuestSession) ScrollWheel(x, y float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindScrollWheel
+	msg.X = x
+	msg.Y = y
+	g.postMessage(msg)
+}
+
+// ScrollBy injects a scroll movement by x and y device-independent pixels.
+// ScrollBy feeds the guest's [ebiten.ScrollDelta] values, while [GuestSession.ScrollWheel] feeds the
+// guest's [ebiten.Wheel] values.
+func (g *GuestSession) ScrollBy(x, y float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindScroll
+	msg.X = x
+	msg.Y = y
+	g.postMessage(msg)
+}
+
+// PinchBy injects a pinch gesture on a touchpad that changes the scale by delta.
+// PinchBy feeds the guest's [ebiten.PinchDelta] value.
+func (g *GuestSession) PinchBy(delta float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindPinch
+	msg.X = delta
+	g.postMessage(msg)
+}
+
+// RotateBy injects a rotation gesture on a touchpad that turns by angle radians. A positive value is
+// clockwise. RotateBy feeds the guest's [ebiten.RotationDelta] value.
+func (g *GuestSession) RotateBy(angle float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindRotate
+	msg.X = angle
+	g.postMessage(msg)
+}
+
+// TypeRune injects a typed character.
+func (g *GuestSession) TypeRune(r rune) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindTypeRune
+	msg.Rune = r
+	g.postMessage(msg)
+}
+
+// queueOpLocked appends o to the request queue and wakes the session goroutine to drain it. g.mu must
+// be held.
+func (g *GuestSession) queueOpLocked(o op) {
+	g.ops = append(g.ops, o)
+	g.cond.Broadcast()
+}
+
+// GamepadState is a snapshot of one gamepad to inject with [GuestSession.UpdateGamepads].
+type GamepadState struct {
+	ID    ebiten.GamepadID
+	SDLID string
+	Name  string
+
+	// Axes and Buttons follow the ebiten gamepad view, where hats are folded into buttons (matching
+	// [ebiten.GamepadAxisValue] and [ebiten.IsGamepadButtonPressed]).
+	Axes    []float64
+	Buttons []bool
+
+	// StandardAxes and StandardButtons hold the standard-layout view; a present key means the standard
+	// axis or button is available, which need not match the SDL ID's database entry — a host may present
+	// any standard layout it likes.
+	StandardAxes    map[ebiten.StandardGamepadAxis]float64
+	StandardButtons map[ebiten.StandardGamepadButton]GamepadStandardButtonState
+
+	// TouchSurfaces holds the current touches of each of the gamepad's touch surfaces, indexed by surface
+	// as in [ebiten.AppendGamepadTouchIDs]; a surface without touches still counts. The guest tracks at
+	// most 16 touches per surface at once and ignores any more until one of them ends. A change in the
+	// number of surfaces makes every touch of the gamepad a new touch.
+	TouchSurfaces [][]GamepadTouchState
+}
+
+// GamepadStandardButtonState is one standard-layout button's pressed flag and its analog value in
+// 0..1.
+type GamepadStandardButtonState struct {
+	Pressed bool
+	Value   float64
+}
+
+// GamepadTouchState is one touch on a gamepad's touch surface.
+type GamepadTouchState struct {
+	// ID identifies the touch across [GuestSession.UpdateGamepads] calls: a touch the previous call
+	// reported on the same surface with the same ID is the same touch, and any other touch is a new
+	// one. The guest assigns each touch its own [ebiten.GamepadTouchID].
+	ID ebiten.GamepadTouchID
+
+	// X and Y are the touch's position, each in 0..1, with (0, 0) at the top left of the surface and
+	// (1, 1) at its bottom right.
+	X float64
+	Y float64
+}
+
+// UpdateGamepads injects the complete set of connected gamepads; a gamepad absent from states is
+// disconnected. Like the other input injectors it is fed independently of [GuestSession.AdvanceTicks]
+// and observed by the guest at its next tick.
+//
+// The caller retains ownership of states and everything it references: the snapshot is copied out
+// before UpdateGamepads returns, so the slice, its elements, and their slices and maps may be reused
+// (e.g. refilled for the next tick).
+func (g *GuestSession) UpdateGamepads(states []GamepadState) {
+	// Gamepad state is polled per tick at the source — continuous axes plus a changing set of connected
+	// devices — so each call resends the whole snapshot, keeping the guest's view authoritative and
+	// self-correcting against a dropped or duplicated message.
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindUpdateGamepads
+	msg.GamepadStates = appendGamepadStatesToProtocol(msg.GamepadStates, states)
+	g.postMessage(msg)
+}
+
+// appendGamepadStatesToProtocol copies states into dst in their protocol form and returns the extended
+// slice, reusing dst's elements and their slices and maps within capacity. An emptied-but-kept buffer
+// encodes like a nil one (gob omits zero-length fields).
+func appendGamepadStatesToProtocol(dst []vmprotocol.GamepadState, states []GamepadState) []vmprotocol.GamepadState {
+	// Reslice through the capacity so the elements there — and their inner buffers — survive both the
+	// extension and a growth's copy.
+	if n := len(states); n <= cap(dst) {
+		dst = dst[:n]
+	} else {
+		dst = slices.Grow(dst[:cap(dst)], n-cap(dst))[:n]
+	}
+	for i := range states {
+		s := &states[i]
+		d := &dst[i]
+		d.ID = int(s.ID)
+		d.SDLID = s.SDLID
+		d.Name = s.Name
+		d.Axes = append(d.Axes[:0], s.Axes...)
+		d.Buttons = append(d.Buttons[:0], s.Buttons...)
+		d.StandardAxes = copyStandardAxesToProtocol(d.StandardAxes, s.StandardAxes)
+		d.StandardButtons = copyStandardButtonsToProtocol(d.StandardButtons, s.StandardButtons)
+		d.TouchSurfaces = copyTouchSurfacesToProtocol(d.TouchSurfaces, s.TouchSurfaces)
+	}
+	return dst
+}
+
+// copyTouchSurfacesToProtocol copies src into dst in its protocol form and returns the result, reusing
+// dst's surfaces and their touch slices within capacity.
+func copyTouchSurfacesToProtocol(dst [][]vmprotocol.GamepadTouchState, src [][]GamepadTouchState) [][]vmprotocol.GamepadTouchState {
+	if n := len(src); n <= cap(dst) {
+		dst = dst[:n]
+	} else {
+		dst = slices.Grow(dst[:cap(dst)], n-cap(dst))[:n]
+	}
+	for i, touches := range src {
+		d := dst[i][:0]
+		for _, t := range touches {
+			d = append(d, vmprotocol.GamepadTouchState{
+				ID: int(t.ID),
+				X:  t.X,
+				Y:  t.Y,
+			})
+		}
+		dst[i] = d
+	}
+	return dst
+}
+
+// copyStandardAxesToProtocol copies src into dst, reusing dst's storage; it allocates only when dst is
+// nil and src has entries.
+func copyStandardAxesToProtocol(dst, src map[ebiten.StandardGamepadAxis]float64) map[ebiten.StandardGamepadAxis]float64 {
+	if dst == nil {
+		if len(src) == 0 {
+			return nil
+		}
+		dst = make(map[ebiten.StandardGamepadAxis]float64, len(src))
+	} else {
+		clear(dst)
+	}
+	maps.Copy(dst, src)
+	return dst
+}
+
+// copyStandardButtonsToProtocol copies src into dst in its protocol form, reusing dst's storage; it
+// allocates only when dst is nil and src has entries.
+func copyStandardButtonsToProtocol(dst map[ebiten.StandardGamepadButton]vmprotocol.GamepadStandardButtonState, src map[ebiten.StandardGamepadButton]GamepadStandardButtonState) map[ebiten.StandardGamepadButton]vmprotocol.GamepadStandardButtonState {
+	if dst == nil {
+		if len(src) == 0 {
+			return nil
+		}
+		dst = make(map[ebiten.StandardGamepadButton]vmprotocol.GamepadStandardButtonState, len(src))
+	} else {
+		clear(dst)
+	}
+	for b, s := range src {
+		dst[b] = vmprotocol.GamepadStandardButtonState{
+			Pressed: s.Pressed,
+			Value:   s.Value,
+		}
+	}
+	return dst
+}
+
+// GamepadVibration is an alias for GuestGamepadVibration.
+//
+// Deprecated: as of v2.11. Use GuestGamepadVibration instead.
+type GamepadVibration = GuestGamepadVibration
+
+// GuestGamepadVibration is a vibration the guest's game requested for one gamepad, passed to the
+// [NewGuestSessionOptions] OnGamepadVibration handler. GamepadID matches the
+// [GuestSession.UpdateGamepads] ID, so a host applies it to the corresponding gamepad with
+// [ebiten.VibrateGamepad].
+type GuestGamepadVibration struct {
+	// StartTick is the guest's [ebiten.Tick] during the Update that requested the vibration.
+	StartTick int
+
+	GamepadID ebiten.GamepadID
+	Duration  time.Duration
+
+	// StrongMagnitude and WeakMagnitude are the low- and high-frequency rumble intensities, in 0..1.
+	StrongMagnitude float64
+	WeakMagnitude   float64
+}
+
+// queueGamepadVibrations queues one event per vibration the tick requested for the handler, stamping
+// each with the tick that produced it. It runs on the session goroutine and does nothing when no handler
+// is registered.
+func (g *GuestSession) queueGamepadVibrations(msg *vmprotocol.GuestMessage) {
+	if g.onGamepadVibration == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for i := range msg.GamepadVibrations {
+		v := &msg.GamepadVibrations[i]
+		g.pendingEvents = append(g.pendingEvents, guestEvent{
+			kind: guestEventGamepadVibration,
+			gamepadVibration: GuestGamepadVibration{
+				StartTick:       msg.StartTick,
+				GamepadID:       ebiten.GamepadID(v.ID),
+				Duration:        v.Duration,
+				StrongMagnitude: v.StrongMagnitude,
+				WeakMagnitude:   v.WeakMagnitude,
+			},
+		})
+	}
+}
+
+// Vibration is an alias for GuestVibration.
+//
+// Deprecated: as of v2.11. Use GuestVibration instead.
+type Vibration = GuestVibration
+
+// GuestVibration is a device vibration the guest's game requested, passed to the [NewGuestSessionOptions]
+// OnVibration handler. A host acts on it by vibrating its own device with [ebiten.Vibrate].
+type GuestVibration struct {
+	// StartTick is the guest's [ebiten.Tick] during the Update that requested the vibration.
+	StartTick int
+
+	Duration time.Duration
+
+	// Magnitude is the vibration strength, in 0..1.
+	Magnitude float64
+}
+
+// queueVibration queues the device vibration the tick requested for the handler, stamped with the tick
+// that produced it. It runs on the session goroutine and does nothing when no handler is registered.
+func (g *GuestSession) queueVibration(msg *vmprotocol.GuestMessage) {
+	if g.onVibration == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pendingEvents = append(g.pendingEvents, guestEvent{
+		kind: guestEventVibration,
+		vibration: GuestVibration{
+			StartTick: msg.StartTick,
+			Duration:  msg.Vibration.Duration,
+			Magnitude: msg.Vibration.Magnitude,
+		},
+	})
+}
+
+// dispatchPendingEvents delivers the queued guest events to their handlers, in arrival order, on the
+// calling goroutine. A queued event's handler is always registered: queueing checks it. Events queued
+// while the handlers run are left for the next dispatch.
+func (g *GuestSession) dispatchPendingEvents() {
+	events := g.takePendingEvents()
+	if len(events) == 0 {
+		return
+	}
+	for i := range events {
+		e := &events[i]
+		switch e.kind {
+		case guestEventGamepadVibration:
+			g.onGamepadVibration(e.gamepadVibration)
+		case guestEventVibration:
+			g.onVibration(e.vibration)
+		case guestEventAudioStream:
+			g.onAudioStream(e.audioStream)
+		case guestEventTextInput:
+			g.onTextInput(e.textInput)
+		}
+	}
+	g.recyclePendingEvents(events)
+}
+
+// takePendingEvents takes ownership of the queued events, handing the spare buffer to the queue so
+// nothing appends to the returned slice. The spare is taken (not shared): a concurrent dispatch gets a
+// fresh slice.
+func (g *GuestSession) takePendingEvents() []guestEvent {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	events := g.pendingEvents
+	if len(events) == 0 {
+		return nil
+	}
+	g.pendingEvents = g.pendingEventsBuf[:0]
+	g.pendingEventsBuf = nil
+	return events
+}
+
+// recyclePendingEvents returns the emptied events buffer as the spare, zeroing the elements so the
+// payloads' pointers are not retained.
+func (g *GuestSession) recyclePendingEvents(events []guestEvent) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pendingEventsBuf = slices.Delete(events, 0, len(events))
+}
+
+// handleTextInput tracks the guest's new text-input session and queues it for the handler. It
+// runs on the session goroutine.
+func (g *GuestSession) handleTextInput(msg *vmprotocol.GuestMessage) {
+	// The guest releases a session before starting the next one, but be robust to a missing end: a new
+	// session supersedes the current one.
+	if g.textInput != nil {
+		g.textInput.markClosed()
+	}
+	t := &GuestTextInput{
+		g:               g,
+		id:              msg.TextInputID,
+		bounds:          msg.TextInputBounds,
+		textBeforeCaret: msg.TextInputTextBeforeCaret,
+		textAfterCaret:  msg.TextInputTextAfterCaret,
+		startTick:       msg.StartTick,
+	}
+	g.textInput = t
+	if g.onTextInput == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pendingEvents = append(g.pendingEvents, guestEvent{
+		kind:      guestEventTextInput,
+		textInput: t,
+	})
+}
+
+// handleTextInputEnd marks the guest's text-input session as released. It runs on the session
+// goroutine.
+func (g *GuestSession) handleTextInputEnd(msg *vmprotocol.GuestMessage) {
+	if g.textInput == nil || g.textInput.id != msg.TextInputID {
+		return
+	}
+	g.textInput.markClosed()
+	g.textInput = nil
+}
+
+// PressTouch injects a touch-press event at (x, y), in outside-screen device-independent pixels.
+//
+// id identifies the touch to MoveTouch and ReleaseTouch. The guest assigns the touch its own
+// [ebiten.TouchID].
+func (g *GuestSession) PressTouch(id ebiten.TouchID, x, y float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindPressTouch
+	msg.Code = int(id)
+	msg.X = x
+	msg.Y = y
+	g.postMessage(msg)
+}
+
+// MoveTouch injects a touch-move event to (x, y), in outside-screen device-independent pixels.
+func (g *GuestSession) MoveTouch(id ebiten.TouchID, x, y float64) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindMoveTouch
+	msg.Code = int(id)
+	msg.X = x
+	msg.Y = y
+	g.postMessage(msg)
+}
+
+// ReleaseTouch injects a touch-release event.
+func (g *GuestSession) ReleaseTouch(id ebiten.TouchID) {
+	msg := g.takeMessage()
+	msg.Kind = vmprotocol.HostMessageKindReleaseTouch
+	msg.Code = int(id)
+	g.postMessage(msg)
+}
+
+// postMessage queues a single host message in submission order. msg must come from takeMessage; the
+// session goroutine recycles it once it is encoded (or it is recycled here when the session has
+// already ended).
+func (g *GuestSession) postMessage(msg *vmprotocol.HostMessage) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		g.recycleMessageLocked(msg)
+		return
+	}
+	g.queueOpLocked(op{
+		kind: opMessage,
+		msg:  msg,
+	})
+}
+
+// takeMessage returns a host message to queue, recycled from the pool when one is available. It is
+// reset: the caller sets the fields its kind needs.
+func (g *GuestSession) takeMessage() *vmprotocol.HostMessage {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.takeMessageLocked()
+}
+
+// takeMessageLocked is takeMessage for callers already holding g.mu.
+func (g *GuestSession) takeMessageLocked() *vmprotocol.HostMessage {
+	n := len(g.msgPool)
+	if n == 0 {
+		return &vmprotocol.HostMessage{}
+	}
+	msg := g.msgPool[n-1]
+	g.msgPool[n-1] = nil
+	g.msgPool = g.msgPool[:n-1]
+	return msg
+}
+
+// recycleMessage resets msg and returns it to the pool for the next takeMessage.
+func (g *GuestSession) recycleMessage(msg *vmprotocol.HostMessage) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.recycleMessageLocked(msg)
+}
+
+// recycleMessageLocked is recycleMessage for callers already holding g.mu.
+func (g *GuestSession) recycleMessageLocked(msg *vmprotocol.HostMessage) {
+	// The reset keeps the GamepadStates buffer — and, within it, each element's slices and maps — so the
+	// next UpdateGamepads copies into the same storage.
+	*msg = vmprotocol.HostMessage{GamepadStates: msg.GamepadStates[:0]}
+	g.msgPool = append(g.msgPool, msg)
+}
+
+// Close stops the session, releases the host images mirrored for it, and closes the connection. It
+// ends the session, not the guest's process: the guest's [ebiten.RunGame] returns (with a nil error,
+// as when its window is closed), and the process exits on its own. Close releases the mirror images
+// that [GuestSession.CompositeFrame] composites, so it must be called from within the host's frame and
+// not concurrently with it.
+func (g *GuestSession) Close() error {
+	g.closeOnce.Do(func() {
+		g.requestClose()
+		// Unblock the session goroutine if it is mid-read on a wedged guest. When it is idle this is a
+		// harmless no-op: it wakes from the broadcast and exits without touching the connection again.
+		deadlineErr := g.markConnClosing()
+		if deadlineErr != nil {
+			// A connection that cannot set deadlines must be closed to unblock pending I/O.
+			g.closeErr = g.conn.Close()
+		}
+		<-g.done
+
+		g.renderer.dispose()
+		g.readbacks = nil
+		g.readbackPixelsBuf = nil
+		if deadlineErr == nil {
+			g.closeErr = g.conn.Close()
+		}
+		ui.UnregisterVMHost()
+	})
+	return g.closeErr
+}
+
+// markConnClosing stops the connection for good: a Read or Write already in flight on a wedged guest
+// fails at once, and so does every later one.
+func (g *GuestSession) markConnClosing() error {
+	if g.idleConn != nil {
+		return g.idleConn.markClosing()
+	}
+	// With no wrapper nothing refreshes the deadline, so expiring it once is enough.
+	return g.conn.SetDeadline(time.Now())
+}
+
+// requestClose marks the session closed and wakes the session goroutine.
+func (g *GuestSession) requestClose() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+	g.cond.Broadcast()
+}
+
+// audioReadResult is the outcome of an opReadAudio, delivered to the waiting GuestAudioStream.Read.
+type audioReadResult struct {
+	pcm []byte
+	eof bool
+}
+
+// runReadAudio reads one audio player's samples from the guest and delivers them to the waiting
+// GuestAudioStream.Read. It must be called without g.mu held.
+func (g *GuestSession) runReadAudio(o op) error {
+	result := audioReadResult{eof: true}
+	defer func() { o.audioResp <- result }()
+	g.audioReadPCM = nil
+	g.audioReadEOF = false
+	if err := g.sendAndReceive(&vmprotocol.HostMessage{
+		Kind:               vmprotocol.HostMessageKindReadAudio,
+		AudioPlayerID:      o.audioID,
+		AudioMaxLenInBytes: o.audioMaxLenInBytes,
+	}); err != nil {
+		return err
+	}
+	result = audioReadResult{
+		pcm: g.audioReadPCM,
+		eof: g.audioReadEOF,
+	}
+	return nil
+}
+
+// drainQueuedReads reports end-of-stream to every audio read still queued when the session ends.
+func (g *GuestSession) drainQueuedReads() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// The session loop has stopped and no further read can be queued. An in-flight read
+	// has already received its result from runReadAudio and is no longer in g.ops.
+	for _, o := range g.ops {
+		if o.kind == opReadAudio {
+			o.audioResp <- audioReadResult{eof: true}
+		}
+	}
+	g.ops = nil
+}
+
+// applyAudioControl applies a tick's control changes: it records the sample rate and each player's
+// playing flag and volume, creating a GuestAudioStream for an unseen ID. It runs on the session
+// goroutine; the players' Read fetch their samples concurrently, each under its own lock.
+func (g *GuestSession) applyAudioControl(msg *vmprotocol.GuestMessage) {
+	// The new streams are collected under audioMu and queued for the handler under mu afterward, so the
+	// two locks never nest.
+	newStreams := g.updateAudioStreams(msg)
+	if len(newStreams) == 0 {
+		return
+	}
+	// Queue each new stream for the handler in creation order (AudioControls arrive sorted by ID). By the
+	// time the handler runs, the stream's control is applied, so its Playing and Volume reflect at least
+	// this tick.
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, p := range newStreams {
+		g.pendingEvents = append(g.pendingEvents, guestEvent{
+			kind:        guestEventAudioStream,
+			audioStream: p,
+		})
+	}
+}
+
+// updateAudioStreams records the sample rate and each player's playing flag and volume, creating a
+// GuestAudioStream for an unseen ID. It returns the streams created for the handler, none when no
+// handler is registered.
+func (g *GuestSession) updateAudioStreams(msg *vmprotocol.GuestMessage) []*GuestAudioStream {
+	g.audioMu.Lock()
+	defer g.audioMu.Unlock()
+	var newStreams []*GuestAudioStream
+	g.audioSampleRate = msg.AudioSampleRate
+	for i := range msg.AudioControls {
+		c := &msg.AudioControls[i]
+		if c.Closed {
+			// The guest closed the player: mark the stream not playing and drop it. An unknown ID (never
+			// observed, or already gone) is ignored.
+			if p := g.audioStreams[c.ID]; p != nil {
+				p.markClosed()
+				delete(g.audioStreams, c.ID)
+			}
+			continue
+		}
+		p := g.audioStreams[c.ID]
+		if p == nil {
+			p = &GuestAudioStream{
+				session:   g,
+				id:        c.ID,
+				rate:      msg.AudioSampleRate,
+				startTick: msg.StartTick,
+			}
+			g.audioStreams[c.ID] = p
+			if g.onAudioStream != nil {
+				newStreams = append(newStreams, p)
+			}
+		}
+		p.setControl(c.Playing, c.Volume)
+	}
+	return newStreams
+}
+
+// AudioSampleRate returns the sample rate of the guest's audio, in per-channel samples per second, as
+// reported by the guest. It is 0 until the guest has played audio. The guest uses the rate its game
+// chose; the host need not match it (or play the audio at all), but a host that does play it should
+// use this rate.
+func (g *GuestSession) AudioSampleRate() int {
+	g.audioMu.Lock()
+	defer g.audioMu.Unlock()
+	return g.audioSampleRate
+}
+
+// setRequestedTPS records the guest's reported requested TPS.
+func (g *GuestSession) setRequestedTPS(tps int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.requestedTPS = tps
+}
+
+// RequestedTPS returns the ticks-per-second the guest's game requests via [ebiten.SetTPS], which may be
+// [ebiten.SyncWithFPS]. It is the standard default until the guest's game changes it. The host drives
+// the guest's ticks itself, so this is advisory; a host pacing the guest in real time should honor it.
+func (g *GuestSession) RequestedTPS() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.requestedTPS
+}
+
+// setCursorShape records the guest's reported cursor shape.
+func (g *GuestSession) setCursorShape(shape ebiten.CursorShapeType) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.cursorShape = shape
+}
+
+// CursorShape returns the cursor shape the guest's game requests via [ebiten.SetCursorShape]. It is
+// [ebiten.CursorShapeDefault] until the guest's game changes it. The guest has no cursor of its own,
+// so a host honors it by applying the shape to its own cursor while the cursor is over the guest's
+// screen.
+func (g *GuestSession) CursorShape() ebiten.CursorShapeType {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.cursorShape
+}
+
+// readGuestAudio fills b with player id's samples from the guest, truncated to whole stereo frames,
+// and reports the number of bytes written and whether the source has ended. It is called from a
+// GuestAudioStream.Read on an arbitrary goroutine: it queues a read for the session goroutine (which
+// owns the connection) and waits. A closed or failed session reads as end-of-stream.
+func (g *GuestSession) readGuestAudio(id int64, b []byte) (n int, eof bool) {
+	// Round len(b) down to a multiple of 8 — one float32 per channel, two channels — so a sample is
+	// never split across reads.
+	maxLenInBytes := len(b) - len(b)%8
+	// Query even when maxLenInBytes is 0, so the guest's true end-of-stream state is reported regardless of
+	// the buffer size. The guest returns at most maxLenInBytes, so the result always fits in b.
+	resp, ok := g.queueReadAudio(id, maxLenInBytes)
+	if !ok {
+		return 0, true
+	}
+
+	// Each accepted read receives one result, including end-of-stream on shutdown.
+	// Only the reader returns the channel, after consuming that result.
+	defer g.audioReadResultChannelPool.Put(resp)
+	res := <-resp
+	return copy(b, res.pcm), res.eof
+}
+
+// queueReadAudio queues a read of player id's samples for the session goroutine and wakes it,
+// returning the channel its result will arrive on. ok is false when the session has closed or failed,
+// so no read is queued.
+func (g *GuestSession) queueReadAudio(id int64, maxLenInBytes int) (resp chan audioReadResult, ok bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.err != nil {
+		return nil, false
+	}
+	resp = g.audioReadResultChannelPool.Get().(chan audioReadResult)
+	g.queueOpLocked(op{
+		kind:               opReadAudio,
+		audioID:            id,
+		audioMaxLenInBytes: maxLenInBytes,
+		audioResp:          resp,
+	})
+	return resp, true
+}
+
+// EndpointURLFromAddr formats a host endpoint URL for the given address, typically a [net.Listener]'s,
+// so it can be passed to a guest through EBITENGINE_VM_ENDPOINT or [ebiten.RunGameOptions].VMGuestEndpoint.
+func EndpointURLFromAddr(addr net.Addr) (string, error) {
+	e := vmprotocol.Endpoint{
+		Network: addr.Network(),
+		Address: addr.String(),
+	}
+	return e.URL()
+}

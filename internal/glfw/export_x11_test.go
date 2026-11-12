@@ -1,0 +1,167 @@
+// Copyright 2026 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build freebsd || linux || netbsd
+
+package glfw
+
+import (
+	"errors"
+	"fmt"
+)
+
+// XIPinchDeltasForTest feeds a sequence of pinch gesture events, given as event types and scales, to
+// the conversion that turns their scales into changes, and returns the changes.
+func XIPinchDeltasForTest(evtypes []int32, scales []float64) []float64 {
+	var p xiPinch
+	deltas := make([]float64, len(evtypes))
+	for i := range evtypes {
+		deltas[i] = p.delta(evtypes[i], scales[i])
+	}
+	return deltas
+}
+
+const (
+	XIGesturePinchBeginForTest  = _XI_GesturePinchBegin
+	XIGesturePinchUpdateForTest = _XI_GesturePinchUpdate
+	XIGesturePinchEndForTest    = _XI_GesturePinchEnd
+)
+
+// SmokeTestX11 exercises the purego foundation against a live X server: the
+// libX11 bindings, platform initialization including the fixed-arity
+// variadic XGetIMValues call, the X error handler callback, and the
+// fixed-arity variadic XCreateIC call. platformTerminate is not called, as
+// its GLX/EGL termination is not implemented yet.
+func SmokeTestX11() error {
+	if err := platformInit(); err != nil {
+		return err
+	}
+
+	if _glfw.platformWindow.helperWindowHandle == 0 {
+		return fmt.Errorf("glfw: smoke: no helper window")
+	}
+	if _glfw.platformWindow.UTF8_STRING == 0 {
+		return fmt.Errorf("glfw: smoke: UTF8_STRING atom not interned")
+	}
+
+	// The error handler callback: destroying an invalid window must invoke
+	// the handler with BadWindow.
+	grabErrorHandlerX11()
+	xDestroyWindow(_glfw.platformWindow.display, 0xdeadbeef)
+	if releaseErrorHandlerX11() == _Success {
+		return fmt.Errorf("glfw: smoke: the X error handler was not invoked")
+	}
+
+	// A CRTC that the X server has destroyed, as XWayland does for a monitor
+	// that is turned off, must not reach the default X error handler, which
+	// exits the process (#3094).
+	if _glfw.platformWindow.randr.available && !_glfw.platformWindow.randr.monitorBroken {
+		randr := &_glfw.platformWindow.randr
+		srPtr := randr.GetScreenResourcesCurrent(_glfw.platformWindow.display, _glfw.platformWindow.root)
+		if srPtr == 0 {
+			return fmt.Errorf("glfw: smoke: XRRGetScreenResourcesCurrent failed")
+		}
+		defer randr.FreeScreenResources(srPtr)
+		if ciPtr := getCrtcInfoX11(srPtr, 0xdeadbeef); ciPtr != 0 {
+			randr.FreeCrtcInfo(ciPtr)
+			return fmt.Errorf("glfw: smoke: XRRGetCrtcInfo succeeded for a destroyed CRTC")
+		}
+	}
+
+	// The fixed-arity variadic XCreateIC call, when an input method is
+	// available (it is not under a bare Xvfb without an IM server).
+	if _glfw.platformWindow.im != 0 {
+		ic := xCreateIC(_glfw.platformWindow.im,
+			"inputStyle", _XIMPreeditNothing|_XIMStatusNothing,
+			"clientWindow", _glfw.platformWindow.helperWindowHandle,
+			"focusWindow", _glfw.platformWindow.helperWindowHandle,
+			0)
+		if ic == 0 {
+			return fmt.Errorf("glfw: smoke: XCreateIC failed")
+		}
+		xDestroyIC(ic)
+	}
+
+	// Cursor teardown must free each cursor exactly once (#3465). These shapes
+	// always resolve to a real handle even without a cursor theme (as under a
+	// bare Xvfb), so destroying them all must not raise a BadCursor from a
+	// double free.
+	_glfw.initialized = true
+	defer func() {
+		_glfw.initialized = false
+	}()
+	for _, shape := range []StandardCursor{
+		ArrowCursor, IBeamCursor, CrosshairCursor, HandCursor,
+		HResizeCursor, VResizeCursor, ResizeAllCursor,
+	} {
+		if _, err := CreateStandardCursor(shape); err != nil {
+			return fmt.Errorf("glfw: smoke: CreateStandardCursor failed: %w", err)
+		}
+	}
+	grabErrorHandlerX11()
+	cursorErr := destroyCursors()
+	cursorErrorCode := releaseErrorHandlerX11()
+	if cursorErr != nil {
+		return fmt.Errorf("glfw: smoke: destroyCursors failed: %w", cursorErr)
+	}
+	if cursorErrorCode != _Success {
+		return fmt.Errorf("glfw: smoke: cursor teardown raised an X error (code %d), likely a double free", cursorErrorCode)
+	}
+
+	xDestroyWindow(_glfw.platformWindow.display, 0xdeadbeef)
+	xSync(_glfw.platformWindow.display, false)
+	if err := PollEvents(); !errors.Is(err, ErrPlatform) {
+		return fmt.Errorf("glfw: smoke: PollEvents after an X error outside a grabErrorHandlerX11 bracket returned %v, want ErrPlatform", err)
+	}
+	if err := PollEvents(); err != nil {
+		return fmt.Errorf("glfw: smoke: PollEvents reported an already reported X error again: %w", err)
+	}
+
+	return nil
+}
+
+// SendFailingXRequestForTest sends a request that fails with BadWindow, without waiting for the
+// error to arrive.
+func SendFailingXRequestForTest() {
+	xDestroyWindow(_glfw.platformWindow.display, 0xdeadbeef)
+}
+
+type XIScrollAxis = xiScrollAxis
+
+const (
+	XIScrollTypeVertical   = _XIScrollTypeVertical
+	XIScrollTypeHorizontal = _XIScrollTypeHorizontal
+)
+
+func NewXIScrollAxis(number, scrollType int32, increment float64) XIScrollAxis {
+	return xiScrollAxis{
+		number:     number,
+		scrollType: scrollType,
+		increment:  increment,
+	}
+}
+
+func XIScrollAxisOffset(axes []XIScrollAxis, number int32, delta float64) (xoff, yoff float64) {
+	return xiScrollAxisOffset(axes, number, delta)
+}
+
+type XIPendingScrolls = map[int32]xiPendingScroll
+
+func XIRecordPendingScroll(pending XIPendingScrolls, sourceid int32, time uint, xoff, yoff float64) {
+	xiRecordPendingScroll(pending, sourceid, _Time(time), xoff, yoff)
+}
+
+func XITakePendingScroll(pending XIPendingScrolls, sourceid int32, time uint) (xoff, yoff float64) {
+	return xiTakePendingScroll(pending, sourceid, _Time(time))
+}

@@ -1,0 +1,91 @@
+// Copyright 2016 Hajime Hoshi
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build android || ios
+
+package ebitenmobileview
+
+import (
+	"sync"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/ui"
+)
+
+type position struct {
+	x float64
+	y float64
+}
+
+var (
+	// inputMu protects the variables below and ptrToID in input_ios.go.
+	// The platform entry points are expected to run on the UI thread only;
+	// inputMu makes that confinement explicit.
+	inputMu sync.Mutex
+
+	keyEvents []ui.KeyEvent
+	touches   = map[int]position{}
+
+	// capsLock and numLock stay unknown until a physical keyboard reports them.
+	capsLock ui.LockKeyState
+	numLock  ui.LockKeyState
+
+	touchSlice []ui.TouchForInput
+)
+
+// setKeyPressed records a key press with inputMu held.
+func setKeyPressed(key ui.Key) {
+	keyEvents = append(keyEvents, ui.KeyEvent{
+		Key:     key,
+		Pressed: true,
+	})
+}
+
+// setKeyReleased records a key release with inputMu held.
+func setKeyReleased(key ui.Key) {
+	keyEvents = append(keyEvents, ui.KeyEvent{
+		Key: key,
+	})
+}
+
+// updateInput copies the guarded state to the platform input state.
+//
+// updateInput must be called with inputMu held.
+func updateInput(runes []rune) {
+	touchSlice = touchSlice[:0]
+	for id, position := range touches {
+		touchSlice = append(touchSlice, ui.TouchForInput{
+			ID: id,
+			X:  position.x,
+			Y:  position.y,
+		})
+	}
+
+	ui.Get().UpdateInput(keyEvents, runes, touchSlice, capsLock, numLock)
+	keyEvents = keyEvents[:0]
+}
+
+// UpdatePinch reports a pinch gesture on a touchpad or a touch screen, as the change of the scale it asks for
+// since the last call. centerX and centerY are the point the gesture is done around, in device-independent
+// pixels relative to the view, as the positions of touches.
+func UpdatePinch(delta float64, centerX, centerY float64) {
+	ui.Get().UpdatePinch(delta, centerX, centerY)
+}
+
+// UpdateRotation reports a rotation gesture with two fingers on a touchpad or a touch screen, as the angle
+// it turns by since the last call, in radians. A positive value is clockwise. centerX and centerY are the
+// point the gesture is done around, in device-independent pixels relative to the view, as the positions of
+// touches.
+func UpdateRotation(delta float64, centerX, centerY float64) {
+	ui.Get().UpdateRotation(delta, centerX, centerY)
+}

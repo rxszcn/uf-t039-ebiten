@@ -1,0 +1,592 @@
+// Copyright 2015 Hajime Hoshi
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package ui
+
+import (
+	"math"
+	"regexp"
+	"syscall/js"
+	"unicode"
+
+	"golang.org/x/text/unicode/norm"
+)
+
+var (
+	stringAlt     = js.ValueOf("Alt")
+	stringControl = js.ValueOf("Control")
+	stringMeta    = js.ValueOf("Meta")
+	stringShift   = js.ValueOf("Shift")
+
+	stringKeydown     = js.ValueOf("keydown")
+	stringKeyup       = js.ValueOf("keyup")
+	stringMousedown   = js.ValueOf("mousedown")
+	stringMouseup     = js.ValueOf("mouseup")
+	stringMousemove   = js.ValueOf("mousemove")
+	stringWheel       = js.ValueOf("wheel")
+	stringTouchstart  = js.ValueOf("touchstart")
+	stringTouchend    = js.ValueOf("touchend")
+	stringTouchmove   = js.ValueOf("touchmove")
+	stringTouchcancel = js.ValueOf("touchcancel")
+
+	stringGesturestart  = js.ValueOf("gesturestart")
+	stringGesturechange = js.ValueOf("gesturechange")
+	stringGestureend    = js.ValueOf("gestureend")
+
+	stringAltGraph = js.ValueOf("AltGraph")
+	stringCapsLock = js.ValueOf("CapsLock")
+	stringNumLock  = js.ValueOf("NumLock")
+)
+
+var appleUserAgent = regexp.MustCompile(`\b(Macintosh|iPhone|iPad)\b`)
+
+// isApple reports whether the browser runs on an Apple platform.
+var isApple = func() bool {
+	nav := js.Global().Get("navigator")
+	if !nav.Truthy() {
+		return false
+	}
+	ua := nav.Get("userAgent")
+	if ua.Type() != js.TypeString {
+		return false
+	}
+	return appleUserAgent.MatchString(ua.String())
+}()
+
+func jsCodeToID(code js.Value) Key {
+	// js.Value cannot be used as a map key.
+	// As the number of keys is around 100, just a dumb loop should work.
+	for uiKey, jsCode := range uiKeyToJSCode {
+		if jsCode.Equal(code) {
+			return uiKey
+		}
+	}
+	return -1
+}
+
+var codeToMouseButton = map[int]MouseButton{
+	0: MouseButton0, // Left
+	1: MouseButton1, // Middle
+	2: MouseButton2, // Right
+	3: MouseButton3,
+	4: MouseButton4,
+}
+
+func eventToKeys(e js.Value) (key0, key1 Key) {
+	id := jsCodeToID(e.Get("code"))
+	if id >= 0 {
+		return id, -1
+	}
+
+	// With a virtual keyboard on mobile devices, e.code is empty. Use a 'key' property instead (#2898).
+	key := e.Get("key")
+
+	// The key property doesn't distinguish between left and right modifier keys.
+	// Let's assume both keys are pressed.
+	switch {
+	case key.Equal(stringAlt):
+		return KeyAltLeft, KeyAltRight
+	case key.Equal(stringControl):
+		return KeyControlLeft, KeyControlRight
+	case key.Equal(stringMeta):
+		return KeyMetaLeft, KeyMetaRight
+	case key.Equal(stringShift):
+		return KeyShiftLeft, KeyShiftRight
+	}
+
+	for uiKey, jsKey := range uiKeyToJSKey {
+		if key.Equal(jsKey) {
+			return uiKey, -1
+		}
+	}
+
+	return -1, -1
+}
+
+func (u *UserInterface) keyDown(event js.Value) {
+	// Ignore key repeats for now.
+	if event.Get("repeat").Bool() {
+		return
+	}
+	now := u.inputState.nextInputTime()
+	key0, key1 := eventToKeys(event)
+	if key0 >= 0 {
+		u.inputState.setKeyPressed(key0, now)
+	}
+	if key1 >= 0 {
+		u.inputState.setKeyPressed(key1, now)
+	}
+}
+
+func (u *UserInterface) keyUp(event js.Value) {
+	now := u.inputState.nextInputTime()
+	key0, key1 := eventToKeys(event)
+	if key0 == KeyControlLeft || key0 == KeyControlRight {
+		// The last mouse event might be before the Control key is released.
+		u.controlKeyInMouseEvent = false
+	}
+	if key0 >= 0 {
+		u.inputState.setKeyReleased(key0, now)
+	}
+	if key1 >= 0 {
+		u.inputState.setKeyReleased(key1, now)
+	}
+}
+
+func (u *UserInterface) mouseDown(code int) {
+	b, ok := codeToMouseButton[code]
+	if !ok {
+		return
+	}
+	u.inputState.setMouseButtonPressed(b, u.inputState.nextInputTime())
+}
+
+func (u *UserInterface) mouseUp(code int) {
+	b, ok := codeToMouseButton[code]
+	if !ok {
+		return
+	}
+	u.inputState.setMouseButtonReleased(b, u.inputState.nextInputTime())
+}
+
+func (u *UserInterface) updateInputFromEvent(e js.Value) error {
+	// Avoid using js.Value.String() as String creates a Uint8Array via a TextEncoder and causes a heavy
+	// overhead (#1437).
+	t := e.Get("type")
+	switch {
+	case t.Equal(stringKeydown):
+		if str := e.Get("key").String(); isKeyString(str) {
+			ctrl := e.Get("ctrlKey").Bool()
+			alt := e.Get("altKey").Bool()
+			meta := e.Get("metaKey").Bool()
+			altGraph := e.Call("getModifierState", stringAltGraph).Bool()
+			// Like the desktop backends, report no characters for shortcut chords (#3502).
+			if !isShortcutChord(ctrl, alt, meta, altGraph, isApple) {
+				for _, r := range str {
+					u.inputState.appendRune(r)
+				}
+			}
+		}
+		u.keyDown(e)
+	case t.Equal(stringKeyup):
+		u.keyUp(e)
+	case t.Equal(stringMousedown):
+		u.mouseDown(e.Get("button").Int())
+		u.setMouseCursorFromEvent(e)
+	case t.Equal(stringMouseup):
+		u.mouseUp(e.Get("button").Int())
+		u.setMouseCursorFromEvent(e)
+	case t.Equal(stringMousemove):
+		u.setMouseCursorFromEvent(e)
+	case t.Equal(stringWheel):
+		dx := -e.Get("deltaX").Float()
+		dy := -e.Get("deltaY").Float()
+
+		// deltaMode indicates the unit of deltaX and deltaY.
+		const (
+			domDeltaPixel = 0
+			domDeltaLine  = 1
+			domDeltaPage  = 2
+		)
+		var scrollDeltaX, scrollDeltaY float64
+		switch e.Get("deltaMode").Int() {
+		case domDeltaPixel:
+			// CSS pixels are device-independent pixels.
+			scrollDeltaX = dx
+			scrollDeltaY = dy
+		case domDeltaLine:
+			scrollDeltaX = dx * pixelsPerScrollLine
+			scrollDeltaY = dy * pixelsPerScrollLine
+		case domDeltaPage:
+			window := js.Global().Get("window")
+			scrollDeltaX = dx * window.Get("innerWidth").Float()
+			scrollDeltaY = dy * window.Get("innerHeight").Float()
+		}
+
+		if isWheelPinch(e.Get("ctrlKey").Bool(), u.isControlKeyDown()) {
+			// Safari reports a pinch with gesture events instead. Do not count it twice in case it
+			// reports both.
+			if !u.inGesture {
+				u.inputState.addPinch(wheelPinchDelta(scrollDeltaY))
+			}
+			break
+		}
+
+		u.inputState.WheelX += dx
+		u.inputState.WheelY += dy
+		u.inputState.ScrollDeltaX += scrollDeltaX
+		u.inputState.ScrollDeltaY += scrollDeltaY
+	case t.Equal(stringGesturestart):
+		u.inGesture = true
+		u.gestureScale = 1
+		u.gestureRotation = 0
+	case t.Equal(stringGesturechange):
+		if !u.inGesture {
+			break
+		}
+		scale := e.Get("scale").Float()
+		rotation := e.Get("rotation").Float()
+		// On a touch screen, a pinch is reported by touches, like the other platforms.
+		if len(u.touchesInClient) == 0 && u.gestureScale > 0 {
+			u.inputState.addPinch(scale/u.gestureScale - 1)
+			// rotation is in degrees, and a positive value is clockwise.
+			u.inputState.RotationDelta += (rotation - u.gestureRotation) * math.Pi / 180
+		}
+		u.gestureScale = scale
+		u.gestureRotation = rotation
+	case t.Equal(stringGestureend):
+		u.inGesture = false
+	case t.Equal(stringTouchstart) || t.Equal(stringTouchend) || t.Equal(stringTouchmove) || t.Equal(stringTouchcancel):
+		u.updateTouchesFromEvent(e)
+	}
+
+	// A browser reports the lock key states only as part of an input event. KeyboardEvent and
+	// MouseEvent carry them; TouchEvent does not.
+	switch {
+	case t.Equal(stringKeydown), t.Equal(stringKeyup), t.Equal(stringMousedown), t.Equal(stringMouseup),
+		t.Equal(stringMousemove), t.Equal(stringWheel):
+		u.inputState.CapsLock = NewLockKeyStateFromBool(e.Call("getModifierState", stringCapsLock).Bool())
+		u.inputState.NumLock = NewLockKeyStateFromBool(e.Call("getModifierState", stringNumLock).Bool())
+	}
+
+	u.forceUpdateOnMinimumFPSMode()
+	return nil
+}
+
+// setMouseCursorFromEvent records the cursor position and whether the Control key is down from a mouse event.
+func (u *UserInterface) setMouseCursorFromEvent(e js.Value) {
+	u.controlKeyInMouseEvent = e.Get("ctrlKey").Bool()
+
+	if u.context == nil {
+		return
+	}
+
+	u.origCursorXInClient = e.Get("clientX").Float()
+	u.origCursorYInClient = e.Get("clientY").Float()
+
+	if u.cursorMode == CursorModeCaptured {
+		u.cursorXInClient += e.Get("movementX").Float()
+		u.cursorYInClient += e.Get("movementY").Float()
+		return
+	}
+
+	u.cursorXInClient = u.origCursorXInClient
+	u.cursorYInClient = u.origCursorYInClient
+}
+
+func (u *UserInterface) recoverCursorPosition() {
+	u.cursorXInClient = u.origCursorXInClient
+	u.cursorYInClient = u.origCursorYInClient
+}
+
+// isControlKeyDown reports whether the Control key is down according to the keyboard and mouse events so
+// far. The keyboard events reach the canvas only while it has the focus, and the mouse events report
+// the Control key without the focus, such as in an iframe or while a text field has the focus.
+func (u *UserInterface) isControlKeyDown() bool {
+	if u.controlKeyInMouseEvent {
+		return true
+	}
+	for _, k := range []Key{KeyControlLeft, KeyControlRight} {
+		if u.inputState.KeyReleasedTimes[k] < u.inputState.KeyPressedTimes[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// isWheelPinch reports whether a wheel event is a pinch on a touchpad.
+//
+// Browsers other than Safari report a pinch on a touchpad as a wheel event whose ctrlKey is true, as
+// many pages zoom with Ctrl+wheel, though the Control key is not pressed. ctrlKey is ctrlKey of the
+// event, and controlKeyDown reports whether the Control key is actually down. A wheel event with the
+// Control key down is scrolling.
+func isWheelPinch(ctrlKey, controlKeyDown bool) bool {
+	return ctrlKey && !controlKeyDown
+}
+
+// wheelPinchDelta returns the change of the scale a pinch asks for, from the vertical amount of the
+// wheel event that reports it, in device-independent pixels with the sign of ScrollDelta. Chromium
+// makes the amount of the event as 100 times the logarithm of the scale.
+func wheelPinchDelta(scrollDeltaY float64) float64 {
+	return math.Exp(scrollDeltaY/100) - 1
+}
+
+// clearTouches ends all the touches that are down.
+func (u *UserInterface) clearTouches() {
+	u.touchesInClient = u.touchesInClient[:0]
+	u.touchIDs.nextTouches()
+}
+
+// releaseAllInputs releases all the buttons and touches that are down.
+func (u *UserInterface) releaseAllInputs() {
+	u.inputState.releaseAllButtons(u.inputState.nextInputTime())
+	u.clearTouches()
+}
+
+func (u *UserInterface) updateTouchesFromEvent(e js.Value) {
+	u.clearTouches()
+
+	touches := e.Get("targetTouches")
+	for i := 0; i < touches.Length(); i++ {
+		t := touches.Call("item", i)
+		u.touchesInClient = append(u.touchesInClient, touchInClient{
+			id: u.touchIDs.id(t.Get("identifier").Int()),
+			x:  t.Get("clientX").Float(),
+			y:  t.Get("clientY").Float(),
+		})
+	}
+}
+
+// isShortcutChord reports whether a keydown with the given modifier states is a shortcut chord rather than text input.
+func isShortcutChord(ctrl, alt, meta, altGraph, isApple bool) bool {
+	// Meta is always a shortcut modifier: Command on macOS (e.g. Command+S) and the Windows key elsewhere.
+	if meta {
+		return true
+	}
+	// AltGraph produces characters on many keyboard layouts (e.g. AltGr+Q gives '@' on a German
+	// layout). Windows reports AltGr as Ctrl+Alt, so AltGraph must be checked before Ctrl and Alt.
+	if altGraph {
+		return false
+	}
+	// Ctrl is the shortcut modifier on Windows and Linux (e.g. Ctrl+C). On macOS, where Command takes
+	// that role, Ctrl+letter still produces no printable character on the desktop.
+	if ctrl {
+		return true
+	}
+	// On Apple platforms, Option produces characters (e.g. Option+A gives 'å') and the key string holds
+	// the produced character. Elsewhere, Alt is a shortcut modifier (e.g. Alt+F).
+	return alt && !isApple
+}
+
+func isKeyString(str string) bool {
+	// From https://www.w3.org/TR/uievents-key/#keys-unicode,
+	//
+	//     A key string is a string containing a 0 or 1 non-control characters
+	//     ("base" characters) followed by 0 or more combining characters. The
+	//     string MUST be in Normalized Form C (NFC) as described in
+	//     [UnicodeNormalizationForms].
+	//
+	//     A non-control character is any valid Unicode character except those
+	//     that are part of the "Other, Control" ("Cc") General Category.
+	//
+	//     A combining character is any valid Unicode character in the "Mark,
+	//     Spacing Combining" ("Mc") General Category or with a non-zero
+	//     Combining Class.
+	for i, r := range str {
+		if i == 0 {
+			if unicode.Is(unicode.Cc, r) {
+				return false
+			}
+			continue
+		}
+		if !unicode.Is(unicode.Mc, r) && norm.NFC.PropertiesString(str[i:]).CCC() == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	jsKeyboard                          = js.Global().Get("navigator").Get("keyboard")
+	jsKeyboardLayoutAvailable           bool
+	jsKeyboardGetLayoutMap              js.Value
+	jsKeyboardGetLayoutMapCh            chan js.Value
+	jsKeyboardGetLayoutMapThenCallback  js.Func
+	jsKeyboardGetLayoutMapCatchCallback js.Func
+)
+
+func init() {
+	if !jsKeyboard.Truthy() {
+		return
+	}
+
+	jsKeyboardGetLayoutMap = jsKeyboard.Get("getLayoutMap").Call("bind", jsKeyboard)
+	jsKeyboardGetLayoutMapCh = make(chan js.Value, 1)
+	jsKeyboardGetLayoutMapThenCallback = js.FuncOf(func(this js.Value, args []js.Value) any {
+		jsKeyboardGetLayoutMapCh <- args[0]
+		return nil
+	})
+	jsKeyboardGetLayoutMapCatchCallback = js.FuncOf(func(this js.Value, args []js.Value) any {
+		err := args[0]
+		js.Global().Get("console").Call("error", "ui: navigator.keyboard.getLayoutMap() failed:", err)
+		// A SecurityError means the keyboard-map permissions policy prohibits
+		// the access (e.g., in an iframe without allow="keyboard-map"), which
+		// never recovers, so keep the layout map disabled. For the other
+		// errors, which are assumed to be transient, the map stays undefined
+		// so that the next tick retries (at most once per tick; see KeyName).
+		if err.Type() == js.TypeObject && err.Get("name").String() == "SecurityError" {
+			jsKeyboardLayoutAvailable = false
+		}
+		jsKeyboardGetLayoutMapCh <- js.Undefined()
+		return nil
+	})
+	jsKeyboardLayoutAvailable = true
+}
+
+func (u *UserInterface) KeyName(key Key) string {
+	if !u.isRunning() {
+		return ""
+	}
+
+	if !jsKeyboardLayoutAvailable {
+		return ""
+	}
+
+	// keyboardLayoutMap is reset every tick.
+	// Request the layout map at most once per tick even on failure, so that a
+	// failing request does not cause a new request for every KeyName call.
+	if u.keyboardLayoutMap.IsUndefined() && !u.keyboardLayoutMapRequested {
+		u.keyboardLayoutMapRequested = true
+		// Invoke getLayoutMap every tick to detect the keyboard change.
+		// TODO: Calling this every tick might be inefficient. Is there a way to detect a keyboard change?
+		jsKeyboardGetLayoutMap.Invoke().Call("then", jsKeyboardGetLayoutMapThenCallback).Call("catch", jsKeyboardGetLayoutMapCatchCallback)
+		u.keyboardLayoutMap = <-jsKeyboardGetLayoutMapCh
+	}
+	if u.keyboardLayoutMap.IsUndefined() {
+		return ""
+	}
+
+	n := u.keyboardLayoutMap.Call("get", uiKeyToJSCode[key])
+	if n.IsUndefined() {
+		return ""
+	}
+	return n.String()
+}
+
+func (u *UserInterface) UpdateInputFromEvent(e js.Value) {
+	if err := u.updateInputFromEvent(e); err != nil {
+		u.setError(err)
+	}
+}
+
+func (u *UserInterface) saveCursorPosition() {
+	u.savedCursorX = u.inputState.CursorX
+	u.savedCursorY = u.inputState.CursorY
+	w, h := u.outsideSize()
+	u.savedOutsideWidth = w
+	u.savedOutsideHeight = h
+}
+
+func (u *UserInterface) updateInputStateForFrame(deviceScaleFactor float64) error {
+	s := deviceScaleFactor
+
+	if !math.IsNaN(u.savedCursorX) && !math.IsNaN(u.savedCursorY) {
+		// If savedCursorX and savedCursorY are valid values, the cursor is saved just before entering or exiting from fullscreen.
+		// Even after entering or exiting from fullscreen, the outside (body) size is not updated for a while.
+		// Wait for the outside size to be updated.
+		if w, h := u.outsideSize(); u.savedOutsideWidth != w || u.savedOutsideHeight != h {
+			u.inputState.CursorX = u.savedCursorX
+			u.inputState.CursorY = u.savedCursorY
+			cx, cy := u.context.logicalPositionToClientPosition(u.inputState.CursorX, u.inputState.CursorY, s)
+			u.cursorXInClient = cx
+			u.cursorYInClient = cy
+			u.savedCursorX = math.NaN()
+			u.savedCursorY = math.NaN()
+			u.savedOutsideWidth = 0
+			u.savedOutsideHeight = 0
+			u.outsideSizeUnchangedCount = 0
+		} else {
+			u.outsideSizeUnchangedCount++
+
+			// If the outside size is not changed for a while, probably the screen size is not actually changed.
+			// Reset the state.
+			if u.outsideSizeUnchangedCount > 60 {
+				u.savedCursorX = math.NaN()
+				u.savedCursorY = math.NaN()
+				u.savedOutsideWidth = 0
+				u.savedOutsideHeight = 0
+				u.outsideSizeUnchangedCount = 0
+			}
+		}
+	} else {
+		cx, cy := u.context.clientPositionToLogicalPosition(u.cursorXInClient, u.cursorYInClient, s)
+		u.inputState.CursorX = cx
+		u.inputState.CursorY = cy
+	}
+
+	u.inputState.Touches = u.inputState.Touches[:0]
+	for _, t := range u.touchesInClient {
+		x, y := u.context.clientPositionToLogicalPosition(t.x, t.y, s)
+		u.inputState.Touches = append(u.inputState.Touches, Touch{
+			ID: t.id,
+			X:  x,
+			Y:  y,
+		})
+	}
+
+	return nil
+}
+
+// uiKeyToJSKey is a map from Key values to KeyboardEvent's key values.
+// Note that js.Value cannot be a map key.
+//
+// Reference: https://developer.mozilla.org/en-US/docs/Web/API/UI_Events/Keyboard_event_key_values
+var uiKeyToJSKey = map[Key]js.Value{
+	KeyCapsLock:       js.ValueOf("CapsLock"),
+	KeyNumLock:        js.ValueOf("NumLock"),
+	KeyScrollLock:     js.ValueOf("ScrollLock"),
+	KeyEnter:          js.ValueOf("Enter"),
+	KeyTab:            js.ValueOf("Tab"),
+	KeySpace:          js.ValueOf(" "),
+	KeyArrowDown:      js.ValueOf("ArrowDown"),
+	KeyArrowLeft:      js.ValueOf("ArrowLeft"),
+	KeyArrowRight:     js.ValueOf("ArrowRight"),
+	KeyArrowUp:        js.ValueOf("ArrowUp"),
+	KeyEnd:            js.ValueOf("End"),
+	KeyHome:           js.ValueOf("Home"),
+	KeyPageDown:       js.ValueOf("PageDown"),
+	KeyPageUp:         js.ValueOf("PageUp"),
+	KeyBackspace:      js.ValueOf("Backspace"),
+	KeyDelete:         js.ValueOf("Delete"),
+	KeyInsert:         js.ValueOf("Insert"),
+	KeyContextMenu:    js.ValueOf("ContextMenu"),
+	KeyEscape:         js.ValueOf("Escape"),
+	KeyPause:          js.ValueOf("Pause"),
+	KeyPrintScreen:    js.ValueOf("PrintScreen"),
+	KeyF1:             js.ValueOf("F1"),
+	KeyF2:             js.ValueOf("F2"),
+	KeyF3:             js.ValueOf("F3"),
+	KeyF4:             js.ValueOf("F4"),
+	KeyF5:             js.ValueOf("F5"),
+	KeyF6:             js.ValueOf("F6"),
+	KeyF7:             js.ValueOf("F7"),
+	KeyF8:             js.ValueOf("F8"),
+	KeyF9:             js.ValueOf("F9"),
+	KeyF10:            js.ValueOf("F10"),
+	KeyF11:            js.ValueOf("F11"),
+	KeyF12:            js.ValueOf("F12"),
+	KeyF13:            js.ValueOf("F13"),
+	KeyF14:            js.ValueOf("F14"),
+	KeyF15:            js.ValueOf("F15"),
+	KeyF16:            js.ValueOf("F16"),
+	KeyF17:            js.ValueOf("F17"),
+	KeyF18:            js.ValueOf("F18"),
+	KeyF19:            js.ValueOf("F19"),
+	KeyF20:            js.ValueOf("F20"),
+	KeyNumpadDecimal:  js.ValueOf("Decimal"),
+	KeyNumpadMultiply: js.ValueOf("Multiply"),
+	KeyNumpadAdd:      js.ValueOf("Add"),
+	KeyNumpadDivide:   js.ValueOf("Divide"),
+	KeyNumpadSubtract: js.ValueOf("Subtract"),
+	KeyNumpad0:        js.ValueOf("0"),
+	KeyNumpad1:        js.ValueOf("1"),
+	KeyNumpad2:        js.ValueOf("2"),
+	KeyNumpad3:        js.ValueOf("3"),
+	KeyNumpad4:        js.ValueOf("4"),
+	KeyNumpad5:        js.ValueOf("5"),
+	KeyNumpad6:        js.ValueOf("6"),
+	KeyNumpad7:        js.ValueOf("7"),
+	KeyNumpad8:        js.ValueOf("8"),
+	KeyNumpad9:        js.ValueOf("9"),
+}

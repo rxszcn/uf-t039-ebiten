@@ -1,0 +1,702 @@
+// Copyright 2023 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package graphicscommand
+
+import (
+	"errors"
+	"fmt"
+	"image"
+	"math"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/debug"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphics"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver"
+)
+
+const (
+	is32bit = 1 >> (^uint(0) >> 63)
+	is64bit = 1 - is32bit
+
+	// MaxVertexCount is the maximum number of vertices for one draw call.
+	//
+	// On 64bit architectures, this value is 2^32-1, as the index type is uint32.
+	// This value cannot be exactly 2^32 especially with WebGL 2, as 2^32th vertex is not rendered correctly.
+	// See https://registry.khronos.org/webgl/specs/latest/2.0/#5.18 .
+	//
+	// On 32bit architectures, this value is an adjusted number so that maxVertexFloatCount doesn't overflow int.
+	MaxVertexCount = is64bit*math.MaxUint32 + is32bit*(math.MaxInt32/graphics.VertexFloatCount)
+
+	maxVertexFloatCount = MaxVertexCount * graphics.VertexFloatCount
+)
+
+// The vsync state and whether the graphics driver has been updated for it.
+// The zero value means that vsync is enabled and the graphics driver has not been updated yet.
+const (
+	vsyncEnabledPending = iota
+	vsyncEnabledApplied
+	vsyncDisabledPending
+	vsyncDisabledApplied
+)
+
+var vsyncState atomic.Int32
+
+// SetVsyncEnabled sets whether vsync is enabled.
+// The graphics driver is updated at the next flush.
+//
+// SetVsyncEnabled can be called from any goroutine.
+func SetVsyncEnabled(enabled bool) {
+	if enabled {
+		vsyncState.Store(vsyncEnabledPending)
+		return
+	}
+	vsyncState.Store(vsyncDisabledPending)
+}
+
+func isVsyncEnabled() bool {
+	s := vsyncState.Load()
+	return s == vsyncEnabledPending || s == vsyncEnabledApplied
+}
+
+// applyVsyncEnabledIfNeeded updates the graphics driver's vsync state when the driver has not been
+// updated for the current state yet.
+//
+// The main thread can call SetVsyncEnabled, and the main thread must never wait for the render
+// thread, which can be waiting for the main thread in the middle of a frame. The state is therefore
+// applied on the render thread at a flush.
+//
+// applyVsyncEnabledIfNeeded must be called on the render thread.
+func applyVsyncEnabledIfNeeded(graphicsDriver graphicsdriver.Graphics) {
+	// A state change during the call below makes the compare-and-swap fail, and then the state
+	// stays pending and the next flush applies it.
+	switch s := vsyncState.Load(); s {
+	case vsyncEnabledPending:
+		graphicsDriver.SetVsyncEnabled(true)
+		vsyncState.CompareAndSwap(s, vsyncEnabledApplied)
+	case vsyncDisabledPending:
+		graphicsDriver.SetVsyncEnabled(false)
+		vsyncState.CompareAndSwap(s, vsyncDisabledApplied)
+	}
+}
+
+// FlushCommands executes queued commands with the given flush mode.
+func FlushCommands(graphicsDriver graphicsdriver.Graphics, mode graphicsdriver.FlushMode) error {
+	if err := theCommandQueueManager.flush(graphicsDriver, mode); err != nil {
+		return err
+	}
+	return nil
+}
+
+// commandQueue is a command queue for drawing commands.
+type commandQueue struct {
+	// commands is a queue of drawing commands.
+	commands []command
+
+	// vertices owns the queued vertex data. Commands retain only float counts.
+	vertices []float32
+	indices  []uint32
+
+	tmpNumVertexFloats int
+
+	uint32sBuffer uint32sBuffer
+	finalizers    []func()
+}
+
+// addFinalizer adds a finalizer function to this queue.
+// A finalizer is executed when the command queue is flushed at the end of the frame.
+func (q *commandQueue) addFinalizer(f func()) {
+	q.finalizers = append(q.finalizers, f)
+}
+
+func (q *commandQueue) appendIndices(indices []uint32, offset uint32) {
+	n := len(q.indices)
+	q.indices = append(q.indices, indices...)
+	for i := n; i < len(q.indices); i++ {
+		q.indices[i] += offset
+	}
+}
+
+// mustUseDifferentVertexBuffer reports whether a different vertex buffer must be used.
+func mustUseDifferentVertexBuffer(nextNumVertexFloats int) bool {
+	return nextNumVertexFloats > maxVertexFloatCount
+}
+
+// EnqueueDrawTrianglesCommand enqueues a drawing-image command.
+func (q *commandQueue) EnqueueDrawTrianglesCommand(dst *Image, srcs [graphics.ShaderSrcImageCount]*Image, vertices []float32, indices []uint32, blend graphicsdriver.Blend, dstRegion image.Rectangle, srcRegions [graphics.ShaderSrcImageCount]image.Rectangle, shader *Shader, uniforms []uint32) {
+	if len(vertices) > maxVertexFloatCount {
+		panic(fmt.Sprintf("graphicscommand: len(vertices) must equal to or less than %d but was %d", maxVertexFloatCount, len(vertices)))
+	}
+
+	var split bool
+	if mustUseDifferentVertexBuffer(q.tmpNumVertexFloats + len(vertices)) {
+		q.tmpNumVertexFloats = 0
+		split = true
+	}
+
+	// Assume that all the image sizes are same.
+	// Assume that the images are packed from the front in the slice srcs.
+	q.vertices = append(q.vertices, vertices...)
+	q.appendIndices(indices, uint32(q.tmpNumVertexFloats/graphics.VertexFloatCount))
+	q.tmpNumVertexFloats += len(vertices)
+
+	// prependPreservedUniforms not only prepends values to the given slice but also creates a new slice.
+	// Allocating a new slice is necessary to make EnqueueDrawTrianglesCommand safe.
+	// TODO: This might cause a performance issue (#2601).
+	uniforms = q.prependPreservedUniforms(uniforms, shader, dst, srcs, dstRegion, srcRegions)
+
+	// Remove unused uniform variables so that more commands can be merged.
+	shader.ir.FilterUniformVariables(uniforms)
+
+	// TODO: If dst is the screen, reorder the command to be the last.
+	if !split && 0 < len(q.commands) {
+		if last, ok := q.commands[len(q.commands)-1].(*drawTrianglesCommand); ok {
+			if last.CanMergeWithDrawTrianglesCommand(dst, srcs, blend, shader, uniforms) {
+				last.vertexFloatCount += len(vertices)
+				if last.dstRegions[len(last.dstRegions)-1].Region == dstRegion {
+					last.dstRegions[len(last.dstRegions)-1].IndexCount += len(indices)
+				} else {
+					last.dstRegions = append(last.dstRegions, graphicsdriver.DstRegion{
+						Region:     dstRegion,
+						IndexCount: len(indices),
+					})
+				}
+				return
+			}
+		}
+	}
+
+	c := theDrawTrianglesCommandPool.Get().(*drawTrianglesCommand)
+	c.dst = dst
+	c.srcs = srcs
+	c.vertexFloatCount = len(vertices)
+	c.blend = blend
+	c.dstRegions = append(c.dstRegions[:0], graphicsdriver.DstRegion{
+		Region:     dstRegion,
+		IndexCount: len(indices),
+	})
+	c.shader = shader
+	c.uniforms = uniforms
+	c.firstCaller = ""
+	if debug.IsDebug {
+		file, line, typ := debug.FirstCaller()
+		switch typ {
+		case debug.CallerTypeRegular:
+			c.firstCaller = fmt.Sprintf("%s:%d", file, line)
+		case debug.CallerTypeInternal:
+			c.firstCaller = fmt.Sprintf("%s:%d (internal)", file, line)
+		}
+	}
+	q.commands = append(q.commands, c)
+}
+
+// Enqueue enqueues a drawing command other than a draw-triangles command.
+//
+// For a draw-triangles command, use EnqueueDrawTrianglesCommand.
+func (q *commandQueue) Enqueue(command command) {
+	// TODO: If dst is the screen, reorder the command to be the last.
+	q.commands = append(q.commands, command)
+}
+
+// Flush flushes the command queue.
+//
+// An error at an asynchronous flush is reported to manager instead of being returned.
+func (q *commandQueue) Flush(manager *commandQueueManager, graphicsDriver graphicsdriver.Graphics, mode graphicsdriver.FlushMode) error {
+	var sync bool
+	// Disable asynchronous rendering when vsync is on, as this causes a rendering delay (#2822).
+	if mode == graphicsdriver.FlushModePresent && isVsyncEnabled() {
+		sync = true
+	}
+	if !sync {
+		for _, c := range q.commands {
+			if c.NeedsSync() {
+				sync = true
+				break
+			}
+		}
+	}
+
+	args := commandQueueFlushArgs{
+		queue:          q,
+		manager:        manager,
+		graphicsDriver: graphicsDriver,
+		mode:           mode,
+		logger:         debug.SwitchFrameLogger(),
+		sync:           sync,
+	}
+	if sync {
+		return runOnRenderThread(commandQueueFlushArgs.flush, args)
+	}
+	runOnRenderThreadAsync(commandQueueFlushArgs.flushAsync, args)
+	return nil
+}
+
+type commandQueueFlushArgs struct {
+	queue          *commandQueue
+	manager        *commandQueueManager
+	graphicsDriver graphicsdriver.Graphics
+	mode           graphicsdriver.FlushMode
+	logger         debug.FrameLogger
+	sync           bool
+}
+
+func (a commandQueueFlushArgs) flush() error {
+	defer a.logger.Flush()
+	var flushErr error
+	defer func() {
+		if flushErr != nil {
+			a.manager.abortPendingReadPixels(flushErr)
+		}
+	}()
+	applyVsyncEnabledIfNeeded(a.graphicsDriver)
+	if err := a.queue.flush(a.graphicsDriver, a.mode, a.logger); err != nil {
+		flushErr = err
+		if a.sync {
+			return err
+		}
+		// The queue is not returned to the pool, as an error stops any further flush.
+		a.manager.setError(err)
+		return nil
+	}
+	a.manager.pollReadPixels()
+	a.manager.finishCommandQueueFlush(a.queue, a.mode)
+	return nil
+}
+
+func (a commandQueueFlushArgs) flushAsync() {
+	// Asynchronous flush errors are reported to the manager.
+	_ = a.flush()
+}
+
+// flush must be called on the render thread.
+func (q *commandQueue) flush(graphicsDriver graphicsdriver.Graphics, mode graphicsdriver.FlushMode, logger debug.FrameLogger) (err error) {
+	// Complete the frame even when no commands remain after an intermediate flush.
+	if len(q.commands) == 0 && mode == graphicsdriver.FlushModeIntermediate {
+		return nil
+	}
+
+	es := q.indices
+	vs := q.vertices
+	logger.FrameLogf("Graphics commands:\n")
+
+	var begun bool
+	defer func() {
+		if begun {
+			// Call End even if an error occurs, or the graphics driver's state might be stale (#2388).
+			if graphicsErr := graphicsDriver.End(mode); graphicsErr != nil {
+				err = errors.Join(err, graphicsErr)
+			}
+		}
+		if err != nil {
+			q.abortQueuedReadPixels(err)
+		}
+		if !begun {
+			return
+		}
+
+		// Release the commands explicitly (#1803).
+		// Apparently, the part of a slice between len and cap-1 still holds references.
+		// Then, resetting the length by [:0] doesn't release the references.
+		for i, c := range q.commands {
+			if c, ok := c.(*drawTrianglesCommand); ok {
+				// Only dstRegions owns its backing array and retains its capacity for reuse.
+				// Uniform slices reference buffers owned by the command queue.
+				*c = drawTrianglesCommand{
+					dstRegions: c.dstRegions[:0],
+				}
+				theDrawTrianglesCommandPool.Put(c)
+			}
+			q.commands[i] = nil
+		}
+		q.commands = q.commands[:0]
+		q.vertices = q.vertices[:0]
+		q.indices = q.indices[:0]
+		q.tmpNumVertexFloats = 0
+
+		if mode != graphicsdriver.FlushModeIntermediate {
+			q.releaseResources()
+		}
+	}()
+
+	if err := graphicsDriver.Begin(); err != nil {
+		return err
+	}
+	begun = true
+
+	cs := q.commands
+	for len(cs) > 0 {
+		var nv int
+		var ne int
+		var nc int
+		for _, c := range cs {
+			if dtc, ok := c.(*drawTrianglesCommand); ok {
+				if nc > 0 && mustUseDifferentVertexBuffer(nv+dtc.vertexFloatCount) {
+					break
+				}
+				nv += dtc.vertexFloatCount
+				ne += dtc.numIndices()
+			}
+			nc++
+		}
+		if 0 < ne {
+			if err := graphicsDriver.SetVertices(vs[:nv], es[:ne]); err != nil {
+				return err
+			}
+			es = es[ne:]
+			vs = vs[nv:]
+		}
+		var indexOffset int
+		for _, c := range cs[:nc] {
+			if err := c.Exec(q, graphicsDriver, indexOffset); err != nil {
+				return err
+			}
+			if debug.IsDebug {
+				str := c.String()
+				for {
+					head, tail, ok := strings.Cut(str, "\n")
+					logger.FrameLogf("  %s\n", head)
+					if !ok {
+						break
+					}
+					str = tail
+				}
+			}
+			// TODO: indexOffset should be reset if the command type is different
+			// from the previous one. This fix is needed when another drawing command is
+			// introduced than drawTrianglesCommand.
+			if dtc, ok := c.(*drawTrianglesCommand); ok {
+				indexOffset += dtc.numIndices()
+			}
+		}
+		cs = cs[nc:]
+	}
+
+	return nil
+}
+
+func (q *commandQueue) releaseResources() {
+	q.uint32sBuffer.reset()
+	for i, f := range q.finalizers {
+		f()
+		q.finalizers[i] = nil
+	}
+	q.finalizers = q.finalizers[:0]
+}
+
+type rectangleF32 struct {
+	x      float32
+	y      float32
+	width  float32
+	height float32
+}
+
+func imageRectangleToRectangleF32(r image.Rectangle) rectangleF32 {
+	return rectangleF32{
+		x:      float32(r.Min.X),
+		y:      float32(r.Min.Y),
+		width:  float32(r.Dx()),
+		height: float32(r.Dy()),
+	}
+}
+
+func (q *commandQueue) prependPreservedUniforms(uniforms []uint32, shader *Shader, dst *Image, srcs [graphics.ShaderSrcImageCount]*Image, dstRegion image.Rectangle, srcRegions [graphics.ShaderSrcImageCount]image.Rectangle) []uint32 {
+	origUniforms := uniforms
+	uniforms = q.uint32sBuffer.alloc(len(origUniforms) + graphics.PreservedUniformDwordCount)
+	copy(uniforms[graphics.PreservedUniformDwordCount:], origUniforms)
+	return prependPreservedUniforms(uniforms, shader, dst, srcs, dstRegion, srcRegions)
+}
+
+func prependPreservedUniforms(uniforms []uint32, shader *Shader, dst *Image, srcs [graphics.ShaderSrcImageCount]*Image, dstRegion image.Rectangle, srcRegions [graphics.ShaderSrcImageCount]image.Rectangle) []uint32 {
+	// Set the destination texture size.
+	// Hard-code indices for BCE optimization.
+	_ = uniforms[graphics.PreservedUniformDwordCount-1]
+
+	dw, dh := dst.InternalSize()
+	uniforms[0] = math.Float32bits(float32(dw))
+	uniforms[1] = math.Float32bits(float32(dh))
+
+	if srcs[0] != nil {
+		w, h := srcs[0].InternalSize()
+		uniforms[2] = math.Float32bits(float32(w))
+		uniforms[3] = math.Float32bits(float32(h))
+	} else {
+		uniforms[2] = 0
+		uniforms[3] = 0
+	}
+	if srcs[1] != nil {
+		w, h := srcs[1].InternalSize()
+		uniforms[4] = math.Float32bits(float32(w))
+		uniforms[5] = math.Float32bits(float32(h))
+	} else {
+		uniforms[4] = 0
+		uniforms[5] = 0
+	}
+	if srcs[2] != nil {
+		w, h := srcs[2].InternalSize()
+		uniforms[6] = math.Float32bits(float32(w))
+		uniforms[7] = math.Float32bits(float32(h))
+	} else {
+		uniforms[6] = 0
+		uniforms[7] = 0
+	}
+	if srcs[3] != nil {
+		w, h := srcs[3].InternalSize()
+		uniforms[8] = math.Float32bits(float32(w))
+		uniforms[9] = math.Float32bits(float32(h))
+	} else {
+		uniforms[8] = 0
+		uniforms[9] = 0
+	}
+
+	dr := imageRectangleToRectangleF32(dstRegion)
+
+	// Set the destination region origin.
+	uniforms[10] = math.Float32bits(dr.x)
+	uniforms[11] = math.Float32bits(dr.y)
+
+	// Set the destination region size.
+	uniforms[12] = math.Float32bits(dr.width)
+	uniforms[13] = math.Float32bits(dr.height)
+
+	var srs [graphics.ShaderSrcImageCount]rectangleF32
+	for i, r := range srcRegions {
+		srs[i] = imageRectangleToRectangleF32(r)
+	}
+
+	// Set the source region origins.
+	uniforms[14] = math.Float32bits(srs[0].x)
+	uniforms[15] = math.Float32bits(srs[0].y)
+	uniforms[16] = math.Float32bits(srs[1].x)
+	uniforms[17] = math.Float32bits(srs[1].y)
+	uniforms[18] = math.Float32bits(srs[2].x)
+	uniforms[19] = math.Float32bits(srs[2].y)
+	uniforms[20] = math.Float32bits(srs[3].x)
+	uniforms[21] = math.Float32bits(srs[3].y)
+
+	// Set the source region sizes.
+	uniforms[22] = math.Float32bits(srs[0].width)
+	uniforms[23] = math.Float32bits(srs[0].height)
+	uniforms[24] = math.Float32bits(srs[1].width)
+	uniforms[25] = math.Float32bits(srs[1].height)
+	uniforms[26] = math.Float32bits(srs[2].width)
+	uniforms[27] = math.Float32bits(srs[2].height)
+	uniforms[28] = math.Float32bits(srs[3].width)
+	uniforms[29] = math.Float32bits(srs[3].height)
+
+	// Set the projection matrix.
+	uniforms[30] = math.Float32bits(2 / float32(dw))
+	uniforms[31] = 0
+	uniforms[32] = 0
+	uniforms[33] = 0
+	uniforms[34] = 0
+	uniforms[35] = math.Float32bits(2 / float32(dh))
+	uniforms[36] = 0
+	uniforms[37] = 0
+	uniforms[38] = 0
+	uniforms[39] = 0
+	uniforms[40] = math.Float32bits(1)
+	uniforms[41] = 0
+	uniforms[42] = math.Float32bits(-1)
+	uniforms[43] = math.Float32bits(-1)
+	uniforms[44] = 0
+	uniforms[45] = math.Float32bits(1)
+
+	return uniforms
+}
+
+// Confirm the concrete value of graphics.PreservedUniformDwordCount.
+var _ [0]struct{} = [graphics.PreservedUniformDwordCount - 46]struct{}{}
+
+type commandQueuePool struct {
+	cache []*commandQueue
+	m     sync.Mutex
+}
+
+func (c *commandQueuePool) get() *commandQueue {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	if len(c.cache) == 0 {
+		return &commandQueue{}
+	}
+
+	q := c.cache[len(c.cache)-1]
+	c.cache[len(c.cache)-1] = nil
+	c.cache = c.cache[:len(c.cache)-1]
+	return q
+}
+
+func (c *commandQueuePool) put(queue *commandQueue) {
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	c.cache = append(c.cache, queue)
+}
+
+func (c *commandQueuePool) reuseVertexBuffer(vertices []float32, additional int) []float32 {
+	required := len(vertices) + additional
+	if required <= cap(vertices) {
+		return vertices
+	}
+	c.m.Lock()
+	defer c.m.Unlock()
+	var candidate *commandQueue
+	for _, q := range c.cache {
+		if cap(q.vertices) < required {
+			continue
+		}
+		if candidate == nil || cap(q.vertices) < cap(candidate.vertices) {
+			candidate = q
+		}
+	}
+	if candidate != nil {
+		buffer := candidate.vertices[:len(vertices)]
+		copy(buffer, vertices)
+		candidate.vertices = vertices[:0]
+		return buffer
+	}
+	return vertices
+}
+
+type commandQueueManager struct {
+	pool    commandQueuePool
+	current *commandQueue
+
+	// queuesInUse holds queues whose resources are still needed by the current frame.
+	// Only the render thread accesses queuesInUse.
+	queuesInUse []*commandQueue
+
+	// pendingReadPixels holds the pixel read-backs that have not been finished yet.
+	// Only the render thread accesses pendingReadPixels.
+	pendingReadPixels []*readPixelsRequest
+
+	err atomic.Pointer[error]
+}
+
+var theCommandQueueManager commandQueueManager
+
+// error returns the error at an asynchronous flush if it exists.
+func (c *commandQueueManager) error() error {
+	if err := c.err.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+// setError records the error at an asynchronous flush.
+//
+// setError can be called from any goroutine.
+func (c *commandQueueManager) setError(err error) {
+	for {
+		oldErr := c.err.Load()
+		newErr := err
+		if oldErr != nil {
+			newErr = errors.Join(*oldErr, err)
+		}
+		if c.err.CompareAndSwap(oldErr, &newErr) {
+			return
+		}
+	}
+}
+
+func (c *commandQueueManager) enqueueCommand(command command) {
+	if c.current == nil {
+		c.current = c.pool.get()
+	}
+	c.current.Enqueue(command)
+}
+
+// finishCommandQueueFlush must be called on the render thread.
+func (c *commandQueueManager) finishCommandQueueFlush(queue *commandQueue, mode graphicsdriver.FlushMode) {
+	if mode == graphicsdriver.FlushModeIntermediate {
+		c.queuesInUse = append(c.queuesInUse, queue)
+		return
+	}
+
+	// End has submitted the frame's commands, so every queue used by this frame can be reused.
+	for i, q := range c.queuesInUse {
+		q.releaseResources()
+		c.pool.put(q)
+		c.queuesInUse[i] = nil
+	}
+	c.queuesInUse = c.queuesInUse[:0]
+	c.pool.put(queue)
+}
+
+func (c *commandQueueManager) enqueueDrawTrianglesCommand(dst *Image, srcs [graphics.ShaderSrcImageCount]*Image, vertices []float32, indices []uint32, blend graphicsdriver.Blend, dstRegion image.Rectangle, srcRegions [graphics.ShaderSrcImageCount]image.Rectangle, shader *Shader, uniforms []uint32) {
+	if c.current == nil {
+		c.current = c.pool.get()
+	}
+	c.current.vertices = c.pool.reuseVertexBuffer(c.current.vertices, len(vertices))
+	c.current.EnqueueDrawTrianglesCommand(dst, srcs, vertices, indices, blend, dstRegion, srcRegions, shader, uniforms)
+}
+
+func (c *commandQueueManager) flush(graphicsDriver graphicsdriver.Graphics, mode graphicsdriver.FlushMode) (err error) {
+	defer func() {
+		if err != nil {
+			c.abortReadPixels(err)
+		}
+	}()
+	// An error at an earlier flush stops any further work.
+	if err := c.error(); err != nil {
+		return err
+	}
+
+	// Switch the command queue.
+	prev := c.current
+	c.current = c.pool.get()
+
+	if prev == nil {
+		return nil
+	}
+	if err := prev.Flush(c, graphicsDriver, mode); err != nil {
+		return err
+	}
+
+	// A flush is queued on the render thread after the previous asynchronous flush has finished,
+	// and thus the error of the previous flush is available here.
+	if err := c.error(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// uint32sBuffer is a reusable buffer to allocate []uint32.
+type uint32sBuffer struct {
+	buf []uint32
+}
+
+func roundUpPower2(x int) int {
+	p2 := 1
+	for p2 < x {
+		p2 *= 2
+	}
+	return p2
+}
+
+func (b *uint32sBuffer) alloc(n int) []uint32 {
+	buf := b.buf
+	if len(buf)+n > cap(buf) {
+		buf = make([]uint32, 0, max(roundUpPower2(len(buf)+n), 16))
+	}
+	s := buf[len(buf) : len(buf)+n]
+	b.buf = buf[:len(buf)+n]
+	return s
+}
+
+func (b *uint32sBuffer) reset() {
+	b.buf = b.buf[:0]
+}

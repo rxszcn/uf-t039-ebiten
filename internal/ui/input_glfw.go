@@ -1,0 +1,495 @@
+// Copyright 2015 Hajime Hoshi
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build !android && !ios && !js && !nintendosdk && !playstation5
+
+package ui
+
+import (
+	"io/fs"
+	"math"
+	"runtime"
+	"sync"
+	"time"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/glfw"
+	"github.com/hajimehoshi/ebiten/v2/internal/thread"
+)
+
+var glfwMouseButtonToMouseButton = map[glfw.MouseButton]MouseButton{
+	glfw.MouseButtonLeft:   MouseButton0,
+	glfw.MouseButtonMiddle: MouseButton1,
+	glfw.MouseButtonRight:  MouseButton2,
+	glfw.MouseButton4:      MouseButton3,
+	glfw.MouseButton5:      MouseButton4,
+}
+
+// glfwInput owns the input state that the GLFW callbacks write on the main thread and the game
+// goroutine drains once per tick.
+type glfwInput struct {
+	state InputState
+
+	// savedCursorX and savedCursorY are the cursor position kept across a fullscreen transition
+	// with a disabled cursor, in logical units. They are NaN when no position is saved.
+	savedCursorX float64
+	savedCursorY float64
+
+	// rawCursorX and rawCursorY are the cursor position fetched for the current frame,
+	// in GLFW pixels.
+	rawCursorX float64
+	rawCursorY float64
+
+	lastWheelOffsetX float64
+	lastWheelOffsetY float64
+	lastWheelTime    time.Time
+
+	// scrollPagesX and scrollPagesY are scroll amounts in pages awaiting conversion to pixels, which
+	// needs the window's content size.
+	scrollPagesX float64
+	scrollPagesY float64
+
+	// contentWidth and contentHeight are the window's content size in device-independent pixels, as
+	// last given to the game's Layout. They are 0 until a frame runs.
+	contentWidth  float64
+	contentHeight float64
+
+	mu sync.Mutex
+}
+
+// handleKey records a key action reported by GLFW.
+func (i *glfwInput) handleKey(key Key, action glfw.Action, mods glfw.ModifierKey) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	t := i.state.nextInputTime()
+
+	if action != glfw.Press {
+		i.state.setKeyReleased(key, t)
+		return
+	}
+
+	i.state.setKeyPressed(key, t)
+	// See the comment on syncModKeysByMods for why this is needed and why it is macOS-only.
+	// TODO: This may be redundant with the per-tick syncModKeysFromOS poll. Confirm
+	// within-tick IsKeyJustPressed/IsKeyJustReleased semantics for Cmd+A still hold
+	// without it, then remove.
+	if runtime.GOOS == "darwin" {
+		i.state.syncModKeysByMods(mods, t)
+	}
+}
+
+// handleMouseButton records a mouse button action reported by GLFW.
+func (i *glfwInput) handleMouseButton(button MouseButton, action glfw.Action) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	t := i.state.nextInputTime()
+
+	if action == glfw.Press {
+		i.state.setMouseButtonPressed(button, t)
+		return
+	}
+	i.state.setMouseButtonReleased(button, t)
+}
+
+// appendRune records a character reported by GLFW.
+func (i *glfwInput) appendRune(r rune) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.appendRune(r)
+}
+
+// handleScroll records a wheel offset and a scroll amount reported by GLFW, dropping an anomalous
+// value.
+func (i *glfwInput) handleScroll(wheelX, wheelY, scrollDeltaX, scrollDeltaY float64, unit glfw.ScrollUnit) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	var pagesX, pagesY float64
+	switch unit {
+	case glfw.ScrollUnitNotch:
+		scrollDeltaX *= pixelsPerScrollNotch
+		scrollDeltaY *= pixelsPerScrollNotch
+	case glfw.ScrollUnitLine:
+		scrollDeltaX *= pixelsPerScrollLine
+		scrollDeltaY *= pixelsPerScrollLine
+	case glfw.ScrollUnitPage:
+		pagesX, pagesY = scrollDeltaX, scrollDeltaY
+		scrollDeltaX, scrollDeltaY = 0, 0
+	}
+
+	now := time.Now()
+
+	// Sometimes the wheel event accepts anomalous values like sudden spikes and rapid reversals (#3390).
+	// Such values should be ignored.
+	if now.Sub(i.lastWheelTime) < 100*time.Millisecond {
+		// Thresholds are determined in a heuristic way.
+		const (
+			rapidReversalThreshold = 0.75
+			spikeThreshold         = 50
+		)
+		if math.Abs(wheelX) >= 1 && i.lastWheelOffsetX != 0 {
+			rate := math.Abs(wheelX) / math.Abs(i.lastWheelOffsetX)
+			sb := i.lastWheelOffsetX*wheelX > 0
+			if (rate >= spikeThreshold && sb) || (rate >= rapidReversalThreshold && !sb) {
+				wheelX = 0
+				scrollDeltaX = 0
+				pagesX = 0
+			}
+		}
+		if math.Abs(wheelY) >= 1 && i.lastWheelOffsetY != 0 {
+			rate := math.Abs(wheelY) / math.Abs(i.lastWheelOffsetY)
+			sb := i.lastWheelOffsetY*wheelY > 0
+			if (rate >= spikeThreshold && sb) || (rate >= rapidReversalThreshold && !sb) {
+				wheelY = 0
+				scrollDeltaY = 0
+				pagesY = 0
+			}
+		}
+	}
+
+	i.lastWheelOffsetX = wheelX
+	i.lastWheelOffsetY = wheelY
+	i.lastWheelTime = now
+
+	i.state.WheelX += wheelX
+	i.state.WheelY += wheelY
+	i.state.ScrollDeltaX += scrollDeltaX
+	i.state.ScrollDeltaY += scrollDeltaY
+	i.scrollPagesX += pagesX
+	i.scrollPagesY += pagesY
+}
+
+// handlePinch records the amount of a pinch gesture reported by GLFW.
+func (i *glfwInput) handlePinch(delta float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.addPinch(delta)
+}
+
+// handleRotate records the angle of a rotation gesture reported by GLFW.
+func (i *glfwInput) handleRotate(delta float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.RotationDelta += delta
+}
+
+// setContentSize records the window's content size in device-independent pixels.
+func (i *glfwInput) setContentSize(width, height float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.contentWidth = width
+	i.contentHeight = height
+}
+
+// convertScrollPages converts the pending scroll amounts in pages with the content size. The amounts
+// stay pending while the size is unknown.
+//
+// convertScrollPages must be called with mu held.
+func (i *glfwInput) convertScrollPages() {
+	if i.contentWidth <= 0 || i.contentHeight <= 0 {
+		return
+	}
+	i.state.ScrollDeltaX += i.scrollPagesX * i.contentWidth
+	i.state.ScrollDeltaY += i.scrollPagesY * i.contentHeight
+	i.scrollPagesX = 0
+	i.scrollPagesY = 0
+}
+
+// syncModKeys reconciles the modifier key state against mods.
+func (i *glfwInput) syncModKeys(mods glfw.ModifierKey) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.syncModKeysByMods(mods, 0)
+}
+
+// setLockKeys records the state of the lock keys.
+func (i *glfwInput) setLockKeys(capsLock, numLock LockKeyState) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.CapsLock = capsLock
+	i.state.NumLock = numLock
+}
+
+// setWindowBeingClosed records that the window is being closed.
+func (i *glfwInput) setWindowBeingClosed() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.WindowBeingClosed = true
+}
+
+// setDroppedFiles records the files dropped onto the window.
+func (i *glfwInput) setDroppedFiles(files fs.FS) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.DroppedFiles = files
+}
+
+// read copies the accumulated input state into dst and resets it.
+func (i *glfwInput) read(dst *InputState) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	// A tick can run outside the regular frame, during event polling; converting here makes every
+	// tick see the pages scrolled before it.
+	i.convertScrollPages()
+	i.state.copyAndReset(dst)
+}
+
+// clearSavedCursorPos drops the cursor position saved for a fullscreen transition.
+func (i *glfwInput) clearSavedCursorPos() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.savedCursorX = math.NaN()
+	i.savedCursorY = math.NaN()
+}
+
+// saveCursorPos records the current cursor position so that it survives a fullscreen transition.
+func (i *glfwInput) saveCursorPos() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.savedCursorX = i.state.CursorX
+	i.savedCursorY = i.state.CursorY
+}
+
+// takeSavedCursorPos returns the saved cursor position in logical units and clears it.
+// ok is false when no position is saved.
+func (i *glfwInput) takeSavedCursorPos() (x, y float64, ok bool) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	x, y = i.savedCursorX, i.savedCursorY
+	i.savedCursorX = math.NaN()
+	i.savedCursorY = math.NaN()
+	return x, y, !math.IsNaN(x) && !math.IsNaN(y)
+}
+
+// setRawCursorPos records the cursor position fetched for the current frame, in GLFW pixels.
+func (i *glfwInput) setRawCursorPos(x, y float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.rawCursorX, i.rawCursorY = x, y
+}
+
+// rawCursorPos returns the cursor position fetched for the current frame, in GLFW pixels.
+func (i *glfwInput) rawCursorPos() (x, y float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	return i.rawCursorX, i.rawCursorY
+}
+
+// setCursorPos records the cursor position for the current frame, in logical units.
+func (i *glfwInput) setCursorPos(x, y float64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.state.CursorX, i.state.CursorY = x, y
+}
+
+func (u *glfwBackend) registerInputCallbacks() error {
+	if _, err := u.window.SetKeyCallback(func(w *glfw.Window, key glfw.Key, scancode int, action glfw.Action, mods glfw.ModifierKey) {
+		// Ignore key repeats for now.
+		if action == glfw.Repeat {
+			return
+		}
+
+		uk, ok := glfwKeyToUIKey[key]
+		if !ok {
+			return
+		}
+		u.input.handleKey(uk, action, mods)
+	}); err != nil {
+		return err
+	}
+
+	if _, err := u.window.SetMouseButtonCallback(func(w *glfw.Window, button glfw.MouseButton, action glfw.Action, mods glfw.ModifierKey) {
+		// Ignore key repeats for now.
+		if action == glfw.Repeat {
+			return
+		}
+
+		ub, ok := glfwMouseButtonToMouseButton[button]
+		if !ok {
+			return
+		}
+		u.input.handleMouseButton(ub, action)
+	}); err != nil {
+		return err
+	}
+
+	// The character callback skips the characters that are produced with the modifier combinations
+	// the platform treats as shortcuts, like Ctrl+= on X11 (#3502).
+	if _, err := u.window.SetCharCallback(func(w *glfw.Window, char rune) {
+		u.input.appendRune(char)
+	}); err != nil {
+		return err
+	}
+
+	if _, err := u.window.SetScrollCallback(func(w *glfw.Window, wheelX float64, wheelY float64, scrollDeltaX float64, scrollDeltaY float64, unit glfw.ScrollUnit) {
+		u.input.handleScroll(wheelX, wheelY, scrollDeltaX, scrollDeltaY, unit)
+	}); err != nil {
+		return err
+	}
+
+	if _, err := u.window.SetPinchCallback(func(w *glfw.Window, delta float64) {
+		u.input.handlePinch(delta)
+	}); err != nil {
+		return err
+	}
+
+	if _, err := u.window.SetRotateCallback(func(w *glfw.Window, delta float64) {
+		u.input.handleRotate(delta)
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// updateInputStateForFrame updates the input state using pre-fetched cursor position
+// and device scale factor. GetCursorPos and gamepad.Update are already called in
+// the thread.CallWithArgAndResult block of updateGame, so this avoids an extra round-trip.
+func (u *glfwBackend) updateInputStateForFrame(deviceScaleFactor float64) error {
+	s := deviceScaleFactor
+
+	cx, cy, ok := u.input.takeSavedCursorPos()
+	if ok {
+		// Rare path: cursor position was saved (e.g. fullscreen transition with disabled cursor).
+		// SetCursorPos requires the main thread.
+		cx2, cy2 := u.context.logicalPositionToClientPosition(cx, cy, s)
+		cx2 = dipToGLFWPixel(cx2, s)
+		cy2 = dipToGLFWPixel(cy2, s)
+		type args struct {
+			u    *glfwBackend
+			x, y float64
+		}
+		if err := thread.CallWithArgAndResult(u.mainThread, func(a args) error {
+			return a.u.window.SetCursorPos(a.x, a.y)
+		}, args{u: u, x: cx2, y: cy2}); err != nil {
+			return err
+		}
+	} else {
+		// Common path: use the pre-fetched raw cursor position.
+		rx, ry := u.input.rawCursorPos()
+		cx2 := dipFromGLFWPixel(rx, s)
+		cy2 := dipFromGLFWPixel(ry, s)
+		cx, cy = u.context.clientPositionToLogicalPosition(cx2, cy2, s)
+	}
+
+	// The adjusted position can be NaN at the initialization.
+	if !math.IsNaN(cx) && !math.IsNaN(cy) {
+		u.input.setCursorPos(cx, cy)
+	}
+
+	// gamepad.Update is already called in updateGame's thread.CallWithArgAndResult block.
+	return nil
+}
+
+func (u *glfwBackend) KeyName(key Key) string {
+	gk, ok := uiKeyToGLFWKey[key]
+	if !ok {
+		return ""
+	}
+
+	type args struct {
+		u   *glfwBackend
+		key glfw.Key
+	}
+	return thread.CallWithArgAndResult(u.mainThread, func(a args) string {
+		u, gk := a.u, a.key
+		if u.isTerminated() {
+			return ""
+		}
+		scancode, err := glfw.GetKeyScancode(gk)
+		if err != nil {
+			u.setError(err)
+			return ""
+		}
+		if scancode == -1 {
+			return ""
+		}
+		n, err := glfw.GetKeyName(gk, 0)
+		if err != nil {
+			u.setError(err)
+			return ""
+		}
+		return n
+	}, args{u: u, key: gk})
+}
+
+// syncModKeysByMods reconciles per-key modifier state with a mods bitmask.
+// If t is zero, an input time is allocated only when a key state needs updating.
+//
+// Needed on macOS to recover from text-input intercepts (e.g. Cmd+A) and
+// system hotkey absorption (e.g. Cmd+Shift+4). macOS-only: on Windows,
+// AltGr would make Ctrl appear stuck (#3453).
+//
+// TODO: Revisit how modifier keys are tracked once modifiers get their own type
+// (#3498). This reconciliation exists because modifier state is derived from the
+// per-key press and release times, which the OS does not always deliver. If
+// IsModifierPressed reads the mods bitmask directly instead, this may become
+// unnecessary.
+func (i *InputState) syncModKeysByMods(mods glfw.ModifierKey, t InputTime) {
+	type modMapping struct {
+		mod   glfw.ModifierKey
+		left  Key
+		right Key
+	}
+	mappings := [...]modMapping{
+		{glfw.ModControl, KeyControlLeft, KeyControlRight},
+		{glfw.ModShift, KeyShiftLeft, KeyShiftRight},
+		{glfw.ModAlt, KeyAltLeft, KeyAltRight},
+		{glfw.ModSuper, KeyMetaLeft, KeyMetaRight},
+	}
+	for _, m := range mappings {
+		leftPressed := i.KeyPressedTimes[m.left] > i.KeyReleasedTimes[m.left]
+		rightPressed := i.KeyPressedTimes[m.right] > i.KeyReleasedTimes[m.right]
+		// Leave press times intact when the modifier state is already in sync.
+		if (leftPressed || rightPressed) == (mods&m.mod != 0) {
+			continue
+		}
+		if t == 0 {
+			t = i.nextInputTime()
+		}
+		if mods&m.mod != 0 {
+			// Neither is pressed: press whichever was most recently pressed,
+			// defaulting to the left variant if neither was ever pressed.
+			if i.KeyPressedTimes[m.left] >= i.KeyPressedTimes[m.right] {
+				i.setKeyPressed(m.left, t)
+			} else {
+				i.setKeyPressed(m.right, t)
+			}
+			continue
+		}
+		// The mod flag is clear: release any variant currently in the pressed state.
+		if leftPressed {
+			i.setKeyReleased(m.left, t)
+		}
+		if rightPressed {
+			i.setKeyReleased(m.right, t)
+		}
+	}
+}

@@ -1,0 +1,258 @@
+// Copyright 2023 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package directx
+
+import (
+	"errors"
+	"unsafe"
+
+	"github.com/hajimehoshi/ebiten/v2/internal/graphics"
+	"github.com/hajimehoshi/ebiten/v2/internal/graphicsdriver"
+)
+
+type image12 struct {
+	graphics *graphics12
+	id       graphicsdriver.ImageID
+	width    int
+	height   int
+	screen   bool
+
+	states            [frameCount]_D3D12_RESOURCE_STATES
+	texture           *_ID3D12Resource
+	rtvDescriptorHeap *_ID3D12DescriptorHeap
+
+	uploadingStagingBuffers []*_ID3D12Resource
+}
+
+func (i *image12) ID() graphicsdriver.ImageID {
+	return i.id
+}
+
+func (i *image12) Dispose() {
+	// Dispose the image later as this image might still be used.
+	i.graphics.removeImage(i)
+}
+
+func (i *image12) disposeImpl() {
+	i.releaseUploadingStagingBuffers()
+	if i.rtvDescriptorHeap != nil {
+		i.rtvDescriptorHeap.Release()
+		i.rtvDescriptorHeap = nil
+	}
+	if i.texture != nil {
+		i.texture.Release()
+		i.texture = nil
+	}
+}
+
+func (i *image12) WritePixels(args []graphicsdriver.PixelsArgs) error {
+	if i.screen {
+		return errors.New("directx: WritePixels cannot be called on the screen")
+	}
+
+	// Submit earlier draws without resetting their allocator or waiting for the GPU.
+	// Both lists are DIRECT lists on one queue, so submission order is execution order.
+	if err := i.graphics.submitCommandList(i.graphics.drawCommandList); err != nil {
+		return err
+	}
+
+	// Place each region's pixels in its own footprint in one staging buffer, so that the buffer size is the
+	// total size of the regions regardless of how far apart the regions are.
+	layouts := make([]_D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 0, len(args))
+	var totalBytes uint64
+	for _, a := range args {
+		desc := _D3D12_RESOURCE_DESC{
+			Dimension:        _D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+			Alignment:        0,
+			Width:            uint64(a.Region.Dx()),
+			Height:           uint32(a.Region.Dy()),
+			DepthOrArraySize: 1,
+			MipLevels:        1,
+			Format:           _DXGI_FORMAT_R8G8B8A8_UNORM,
+			SampleDesc: _DXGI_SAMPLE_DESC{
+				Count:   1,
+				Quality: 0,
+			},
+			Layout: _D3D12_TEXTURE_LAYOUT_UNKNOWN,
+			Flags:  _D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+		}
+		// A placed footprint must start at a multiple of the placement alignment.
+		offset := (totalBytes + _D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &^ (_D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1)
+		layout, _, _, n := i.graphics.device.GetCopyableFootprints(&desc, 0, 1, offset)
+		layouts = append(layouts, layout)
+		totalBytes = layout.Offset + n
+	}
+
+	uploadingStagingBuffer, err := createBuffer(i.graphics.device, totalBytes, _D3D12_HEAP_TYPE_UPLOAD)
+	if err != nil {
+		return err
+	}
+	i.uploadingStagingBuffers = append(i.uploadingStagingBuffers, uploadingStagingBuffer)
+
+	if rb, ok := i.transiteState(_D3D12_RESOURCE_STATE_COPY_DEST); ok {
+		i.graphics.copyCommandList.ResourceBarrier([]_D3D12_RESOURCE_BARRIER_Transition{rb})
+	}
+
+	m, err := uploadingStagingBuffer.Map(0, &_D3D12_RANGE{Begin: 0, End: 0})
+	if err != nil {
+		return err
+	}
+
+	i.graphics.needFlushCopyCommandList = true
+
+	srcBytes := unsafe.Slice((*byte)(unsafe.Pointer(m)), totalBytes)
+	for idx, a := range args {
+		layout := layouts[idx]
+		w := 4 * a.Region.Dx()
+		for j := 0; j < a.Region.Dy(); j++ {
+			copy(srcBytes[layout.Offset+uint64(j)*uint64(layout.Footprint.RowPitch):], a.Pixels[j*w:(j+1)*w])
+		}
+	}
+
+	for idx, a := range args {
+		dst := _D3D12_TEXTURE_COPY_LOCATION_SubresourceIndex{
+			pResource:        i.texture,
+			Type:             _D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+			SubresourceIndex: 0,
+		}
+		src := _D3D12_TEXTURE_COPY_LOCATION_PlacedFootprint{
+			pResource:       uploadingStagingBuffer,
+			Type:            _D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+			PlacedFootprint: layouts[idx],
+		}
+		i.graphics.copyCommandList.CopyTextureRegion_SubresourceIndex_PlacedFootprint(
+			&dst, uint32(a.Region.Min.X), uint32(a.Region.Min.Y), 0, &src, &_D3D12_BOX{
+				left:   0,
+				top:    0,
+				front:  0,
+				right:  uint32(a.Region.Dx()),
+				bottom: uint32(a.Region.Dy()),
+				back:   1,
+			})
+	}
+
+	uploadingStagingBuffer.Unmap(0, nil)
+
+	return nil
+}
+
+func (i *image12) resource() *_ID3D12Resource {
+	if i.screen {
+		return i.graphics.renderTargets[i.graphics.backBufferIndex]
+	}
+	return i.texture
+}
+
+func (i *image12) state() _D3D12_RESOURCE_STATES {
+	if i.screen {
+		return i.states[i.graphics.backBufferIndex]
+	}
+	return i.states[0]
+}
+
+func (i *image12) setState(newState _D3D12_RESOURCE_STATES) {
+	if i.screen {
+		i.states[i.graphics.backBufferIndex] = newState
+		return
+	}
+	i.states[0] = newState
+}
+
+func (i *image12) transiteState(newState _D3D12_RESOURCE_STATES) (_D3D12_RESOURCE_BARRIER_Transition, bool) {
+	if i.state() == newState {
+		return _D3D12_RESOURCE_BARRIER_Transition{}, false
+	}
+	oldState := i.state()
+	i.setState(newState)
+
+	return _D3D12_RESOURCE_BARRIER_Transition{
+		Type:  _D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+		Flags: _D3D12_RESOURCE_BARRIER_FLAG_NONE,
+		Transition: _D3D12_RESOURCE_TRANSITION_BARRIER{
+			pResource:   i.resource(),
+			Subresource: _D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+			StateBefore: oldState,
+			StateAfter:  newState,
+		},
+	}, true
+}
+
+func (i *image12) internalSize() (int, int) {
+	if i.screen {
+		return i.width, i.height
+	}
+	return graphics.InternalImageSize(i.width), graphics.InternalImageSize(i.height)
+}
+
+func (i *image12) setAsRenderTarget(drawCommandList *_ID3D12GraphicsCommandList, device *_ID3D12Device) error {
+	if err := i.ensureRenderTargetView(device); err != nil {
+		return err
+	}
+
+	if i.screen {
+		rtv, err := i.graphics.rtvDescriptorHeap.GetCPUDescriptorHandleForHeapStart()
+		if err != nil {
+			return err
+		}
+		rtv.Offset(int32(i.graphics.backBufferIndex), i.graphics.rtvDescriptorSize)
+		drawCommandList.OMSetRenderTargets([]_D3D12_CPU_DESCRIPTOR_HANDLE{rtv}, false)
+		return nil
+	}
+
+	rtv, err := i.rtvDescriptorHeap.GetCPUDescriptorHandleForHeapStart()
+	if err != nil {
+		return err
+	}
+
+	drawCommandList.OMSetRenderTargets([]_D3D12_CPU_DESCRIPTOR_HANDLE{rtv}, false)
+	return nil
+}
+
+func (i *image12) ensureRenderTargetView(device *_ID3D12Device) error {
+	if i.screen {
+		return nil
+	}
+
+	if i.rtvDescriptorHeap != nil {
+		return nil
+	}
+
+	h, err := device.CreateDescriptorHeap(&_D3D12_DESCRIPTOR_HEAP_DESC{
+		Type:           _D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+		NumDescriptors: 1,
+		Flags:          _D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+		NodeMask:       0,
+	})
+	if err != nil {
+		return err
+	}
+	i.rtvDescriptorHeap = h
+
+	rtv, err := i.rtvDescriptorHeap.GetCPUDescriptorHandleForHeapStart()
+	if err != nil {
+		return err
+	}
+	device.CreateRenderTargetView(i.texture, nil, rtv)
+
+	return nil
+}
+
+func (i *image12) releaseUploadingStagingBuffers() {
+	for idx, buf := range i.uploadingStagingBuffers {
+		buf.Release()
+		i.uploadingStagingBuffers[idx] = nil
+	}
+	i.uploadingStagingBuffers = i.uploadingStagingBuffers[:0]
+}

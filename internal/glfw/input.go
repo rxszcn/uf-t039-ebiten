@@ -1,0 +1,577 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2002-2006 Marcus Geelnard
+// SPDX-FileCopyrightText: 2006-2019 Camilla Löwy <elmindreda@glfw.org>
+// SPDX-FileCopyrightText: 2022 The Ebitengine Authors
+
+//go:build darwin || freebsd || linux || netbsd || windows
+
+package glfw
+
+import (
+	"errors"
+	"fmt"
+	"image"
+	"image/draw"
+	"math"
+	"slices"
+)
+
+const stick = 3
+
+func (w *Window) inputKey(key Key, scancode int, action Action, mods ModifierKey) {
+	if key >= 0 && key <= KeyLast {
+		var repeated bool
+
+		if action == Release && w.keys[key] == Release {
+			return
+		}
+
+		if action == Press && w.keys[key] == Press {
+			repeated = true
+		}
+
+		if action == Release && w.stickyKeys {
+			w.keys[key] = stick
+		} else {
+			w.keys[key] = action
+		}
+
+		if repeated {
+			action = Repeat
+		}
+	}
+
+	if !w.lockKeyMods {
+		mods &^= ModCapsLock | ModNumLock
+	}
+
+	if w.callbacks.key != nil {
+		w.callbacks.key(w, key, scancode, action, mods)
+	}
+}
+
+// isTextCodepoint reports whether a codepoint is text an application can
+// insert, which excludes the C0 and C1 control characters and delete.
+func isTextCodepoint(codepoint rune) bool {
+	return codepoint >= 32 && (codepoint <= 126 || codepoint >= 160)
+}
+
+func (w *Window) inputChar(codepoint rune, mods ModifierKey, plain bool) {
+	if !isTextCodepoint(codepoint) {
+		return
+	}
+
+	if !w.lockKeyMods {
+		mods &^= ModCapsLock | ModNumLock
+	}
+
+	if w.callbacks.charmods != nil {
+		w.callbacks.charmods(w, codepoint, mods)
+	}
+
+	if plain {
+		if w.callbacks.character != nil {
+			w.callbacks.character(w, codepoint)
+		}
+	}
+}
+
+func (w *Window) inputScroll(wheelX, wheelY, scrollDeltaX, scrollDeltaY float64, unit ScrollUnit) {
+	if w.callbacks.scroll != nil {
+		w.callbacks.scroll(w, wheelX, wheelY, scrollDeltaX, scrollDeltaY, unit)
+	}
+}
+
+func (w *Window) inputPinch(delta float64) {
+	if w.callbacks.pinch != nil {
+		w.callbacks.pinch(w, delta)
+	}
+}
+
+func (w *Window) inputRotate(delta float64) {
+	if w.callbacks.rotate != nil {
+		w.callbacks.rotate(w, delta)
+	}
+}
+
+func (w *Window) inputMouseClick(button MouseButton, action Action, mods ModifierKey) {
+	if button < 0 || button > MouseButtonLast {
+		return
+	}
+
+	if !w.lockKeyMods {
+		mods &^= ModCapsLock | ModNumLock
+	}
+
+	if action == Release && w.stickyMouseButtons {
+		w.mouseButtons[button] = stick
+	} else {
+		w.mouseButtons[button] = action
+	}
+
+	if w.callbacks.mouseButton != nil {
+		w.callbacks.mouseButton(w, button, action, mods)
+	}
+}
+
+func (w *Window) inputCursorPos(xpos float64, ypos float64) {
+	if w.virtualCursorPosX == xpos && w.virtualCursorPosY == ypos {
+		return
+	}
+
+	w.virtualCursorPosX = xpos
+	w.virtualCursorPosY = ypos
+
+	if w.callbacks.cursorPos != nil {
+		w.callbacks.cursorPos(w, xpos, ypos)
+	}
+}
+
+func (w *Window) inputCursorEnter(entered bool) {
+	if w.callbacks.cursorEnter != nil {
+		w.callbacks.cursorEnter(w, entered)
+	}
+}
+
+func (w *Window) inputDrop(paths []string) {
+	if w.callbacks.drop != nil {
+		w.callbacks.drop(w, paths)
+	}
+}
+
+func (w *Window) centerCursorInContentArea() error {
+	width, height, err := w.platformGetWindowSize()
+	if err != nil {
+		return err
+	}
+	if err := w.platformSetCursorPos(float64(width)/2.0, float64(height)/2.0); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *Window) GetInputMode(mode InputMode) (int, error) {
+	if !_glfw.initialized {
+		return 0, ErrNotInitialized
+	}
+	switch mode {
+	case CursorMode:
+		return w.cursorMode, nil
+	case StickyKeysMode:
+		return boolToInt(w.stickyKeys), nil
+	case StickyMouseButtonsMode:
+		return boolToInt(w.stickyMouseButtons), nil
+	case LockKeyMods:
+		return boolToInt(w.lockKeyMods), nil
+	case RawMouseMotion:
+		return boolToInt(w.rawMouseMotion), nil
+	default:
+		return 0, fmt.Errorf("%w: invalid input mode 0x%08X", ErrInvalidEnum, mode)
+	}
+}
+
+func (w *Window) SetInputMode(mode InputMode, value int) error {
+	if !_glfw.initialized {
+		return ErrNotInitialized
+	}
+
+	switch mode {
+	case CursorMode:
+		if value != CursorNormal && value != CursorHidden && value != CursorDisabled {
+			return fmt.Errorf("%w: invalid cursor mode 0x%08X", ErrInvalidEnum, value)
+		}
+
+		if w.cursorMode == value {
+			return nil
+		}
+
+		w.cursorMode = value
+
+		x, y, err := w.platformGetCursorPos()
+		if err != nil {
+			return err
+		}
+		w.virtualCursorPosX = x
+		w.virtualCursorPosY = y
+
+		if err := w.platformSetCursorMode(value); err != nil {
+			return err
+		}
+		return nil
+
+	case StickyKeysMode:
+		if w.stickyKeys == intToBool(value) {
+			return nil
+		}
+
+		if !intToBool(value) {
+			// Release all sticky keys
+			for i := Key(0); i <= KeyLast; i++ {
+				if w.keys[i] == stick {
+					w.keys[i] = Release
+				}
+			}
+		}
+
+		w.stickyKeys = intToBool(value)
+		return nil
+
+	case StickyMouseButtonsMode:
+		if w.stickyMouseButtons == intToBool(value) {
+			return nil
+		}
+
+		if !intToBool(value) {
+			// Release all sticky mouse buttons
+			for i := MouseButton(0); i <= MouseButtonLast; i++ {
+				if w.mouseButtons[i] == stick {
+					w.mouseButtons[i] = Release
+				}
+			}
+		}
+
+		w.stickyMouseButtons = intToBool(value)
+		return nil
+
+	case LockKeyMods:
+		w.lockKeyMods = intToBool(value)
+		return nil
+
+	case RawMouseMotion:
+		if !platformRawMouseMotionSupported() {
+			return fmt.Errorf("%w: raw mouse motion is not supported on this system", ErrPlatform)
+		}
+
+		if w.rawMouseMotion == intToBool(value) {
+			return nil
+		}
+
+		w.rawMouseMotion = intToBool(value)
+		if err := w.platformSetRawMouseMotion(intToBool(value)); err != nil {
+			return err
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("%w: invalid input mode 0x%08X", ErrInvalidEnum, mode)
+	}
+}
+
+func RawMouseMotionSupported() (bool, error) {
+	if !_glfw.initialized {
+		return false, ErrNotInitialized
+	}
+	return platformRawMouseMotionSupported(), nil
+}
+
+func GetKeyName(key Key, scancode int) (string, error) {
+	if !_glfw.initialized {
+		return "", ErrNotInitialized
+	}
+
+	if key != KeyUnknown {
+		if key < KeySpace || key > KeyLast {
+			return "", fmt.Errorf("%w: invalid key %d", ErrInvalidEnum, key)
+		}
+		if key != KeyKPEqual && (key < KeyKP0 || key > KeyKPAdd) && (key < KeyApostrophe || key > KeyWorld2) {
+			return "", nil
+		}
+		scancode = platformGetKeyScancode(key)
+	}
+
+	return platformGetScancodeName(scancode)
+}
+
+func GetKeyScancode(key Key) (int, error) {
+	if !_glfw.initialized {
+		return 0, ErrNotInitialized
+	}
+
+	if key < KeySpace || key > KeyLast {
+		return 0, fmt.Errorf("%w: invalid key %d", ErrInvalidEnum, key)
+	}
+
+	return platformGetKeyScancode(key), nil
+}
+
+func (w *Window) GetKey(key Key) (Action, error) {
+	if !_glfw.initialized {
+		return 0, ErrNotInitialized
+	}
+
+	if key < KeySpace || key > KeyLast {
+		return 0, fmt.Errorf("%w: invalid key %d", ErrInvalidEnum, key)
+	}
+
+	if w.keys[key] == stick {
+		// Sticky mode: release key now
+		w.keys[key] = Release
+		return Press, nil
+	}
+
+	return w.keys[key], nil
+}
+
+func (w *Window) GetMouseButton(button MouseButton) (Action, error) {
+	if !_glfw.initialized {
+		return 0, ErrNotInitialized
+	}
+
+	if button < MouseButton1 || button > MouseButtonLast {
+		return 0, fmt.Errorf("%w: invalid mouse button %d", ErrInvalidEnum, button)
+	}
+
+	if w.mouseButtons[button] == stick {
+		// Sticky mode: release mouse button now
+		w.mouseButtons[button] = Release
+		return Press, nil
+	}
+
+	return w.mouseButtons[button], nil
+}
+
+func (w *Window) GetCursorPos() (xpos, ypos float64, err error) {
+	if !_glfw.initialized {
+		return 0, 0, ErrNotInitialized
+	}
+
+	if w.cursorMode == CursorDisabled {
+		return w.virtualCursorPosX, w.virtualCursorPosY, nil
+	} else {
+		return w.platformGetCursorPos()
+	}
+}
+
+func (w *Window) SetCursorPos(xpos, ypos float64) error {
+	if !_glfw.initialized {
+		return ErrNotInitialized
+	}
+
+	if xpos != xpos || xpos < -math.MaxFloat64 || xpos > math.MaxFloat64 || ypos != ypos || ypos < -math.MaxFloat64 || ypos > math.MaxFloat64 {
+		return fmt.Errorf("%w: invalid cursor position %f %f", ErrInvalidValue, xpos, ypos)
+	}
+
+	if !w.platformWindowFocused() {
+		return nil
+	}
+
+	if w.cursorMode == CursorDisabled {
+		// Only update the accumulated position if the cursor is disabled
+		w.virtualCursorPosX = xpos
+		w.virtualCursorPosY = ypos
+		return nil
+	} else {
+		// Update system cursor position
+		return w.platformSetCursorPos(xpos, ypos)
+	}
+}
+
+func CreateCursor(img image.Image, xhot, yhot int) (*Cursor, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+
+	b := img.Bounds()
+	if b.Dx() <= 0 || b.Dy() <= 0 {
+		return nil, fmt.Errorf("%w: invalid image dimensions for cursor", ErrInvalidValue)
+	}
+
+	// Convert image to NRGBA.
+	nrgba, ok := img.(*image.NRGBA)
+	if !ok {
+		nrgba = image.NewNRGBA(img.Bounds())
+		draw.Draw(nrgba, nrgba.Bounds(), img, img.Bounds().Min, draw.Src)
+	}
+
+	cursor := &Cursor{}
+	_glfw.cursors = append(_glfw.cursors, cursor)
+
+	if err := cursor.platformCreateCursor(nrgba, xhot, yhot); err != nil {
+		return nil, errors.Join(err, cursor.Destroy())
+	}
+
+	return cursor, nil
+}
+
+func CreateStandardCursor(shape StandardCursor) (*Cursor, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+
+	if shape != ArrowCursor &&
+		shape != IBeamCursor &&
+		shape != CrosshairCursor &&
+		shape != HandCursor &&
+		shape != HResizeCursor &&
+		shape != VResizeCursor &&
+		shape != ResizeNWSECursor &&
+		shape != ResizeNESWCursor &&
+		shape != ResizeAllCursor &&
+		shape != NotAllowedCursor {
+		return nil, fmt.Errorf("%w: invalid standard cursor 0x%08X", ErrInvalidEnum, shape)
+	}
+
+	cursor := &Cursor{}
+	_glfw.cursors = append(_glfw.cursors, cursor)
+
+	if err := cursor.platformCreateStandardCursor(shape); err != nil {
+		return nil, errors.Join(err, cursor.Destroy())
+	}
+
+	return cursor, nil
+}
+
+func (c *Cursor) Destroy() error {
+	if !_glfw.initialized {
+		return ErrNotInitialized
+	}
+
+	if c == nil {
+		return nil
+	}
+
+	// Make sure the cursor is not being used by any window
+	for _, window := range _glfw.windows {
+		if window.cursor == c {
+			if err := window.SetCursor(nil); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := c.platformDestroyCursor(); err != nil {
+		return err
+	}
+
+	// Unlink cursor from global linked list
+	for i, cursor := range _glfw.cursors {
+		if cursor == c {
+			_glfw.cursors = slices.Delete(_glfw.cursors, i, i+1)
+			break
+		}
+	}
+
+	return nil
+}
+
+func (w *Window) SetCursor(cursor *Cursor) error {
+	if !_glfw.initialized {
+		return ErrNotInitialized
+	}
+
+	w.cursor = cursor
+
+	if err := w.platformSetCursor(cursor); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *Window) SetKeyCallback(cbfun KeyCallback) (KeyCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.key
+	w.callbacks.key = cbfun
+	return old, nil
+}
+
+func (w *Window) SetCharCallback(cbfun CharCallback) (CharCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.character
+	w.callbacks.character = cbfun
+	return old, nil
+}
+
+func (w *Window) SetCharModsCallback(cbfun CharModsCallback) (CharModsCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.charmods
+	w.callbacks.charmods = cbfun
+	return old, nil
+}
+
+func (w *Window) SetMouseButtonCallback(cbfun MouseButtonCallback) (MouseButtonCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.mouseButton
+	w.callbacks.mouseButton = cbfun
+	return old, nil
+}
+
+func (w *Window) SetCursorPosCallback(cbfun CursorPosCallback) (CursorPosCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.cursorPos
+	w.callbacks.cursorPos = cbfun
+	return old, nil
+}
+
+func (w *Window) SetCursorEnterCallback(cbfun CursorEnterCallback) (CursorEnterCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.cursorEnter
+	w.callbacks.cursorEnter = cbfun
+	return old, nil
+}
+
+func (w *Window) SetScrollCallback(cbfun ScrollCallback) (ScrollCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.scroll
+	w.callbacks.scroll = cbfun
+	return old, nil
+}
+
+// SetPinchCallback sets the callback for a pinch gesture on a touchpad.
+// The callback is called only on macOS, on Windows with a precision touchpad, and on X11 with
+// XInput 2.4 so far.
+func (w *Window) SetPinchCallback(cbfun PinchCallback) (PinchCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.pinch
+	w.callbacks.pinch = cbfun
+	return old, nil
+}
+
+// SetRotateCallback sets the callback for a rotation gesture on a touchpad.
+// The callback is called only on macOS and on X11 with XInput 2.4 so far.
+func (w *Window) SetRotateCallback(cbfun RotateCallback) (RotateCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.rotate
+	w.callbacks.rotate = cbfun
+	return old, nil
+}
+
+func (w *Window) SetDropCallback(cbfun DropCallback) (DropCallback, error) {
+	if !_glfw.initialized {
+		return nil, ErrNotInitialized
+	}
+	old := w.callbacks.drop
+	w.callbacks.drop = cbfun
+	return old, nil
+}
+
+func (w *Window) SetClipboardString(str string) error {
+	if !_glfw.initialized {
+		return ErrNotInitialized
+	}
+	return platformSetClipboardString(str)
+}
+
+func GetClipboardString() (string, error) {
+	if !_glfw.initialized {
+		return "", ErrNotInitialized
+	}
+	return platformGetClipboardString()
+}

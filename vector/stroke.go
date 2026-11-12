@@ -1,0 +1,492 @@
+// Copyright 2025 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package vector
+
+import (
+	"math"
+	"slices"
+
+	"github.com/hajimehoshi/ebiten/v2"
+)
+
+// LineCap represents the way in which the ends of the stroke are rendered.
+type LineCap int
+
+const (
+	LineCapButt LineCap = iota
+	LineCapRound
+	LineCapSquare
+)
+
+// LineJoin represents the way in which two segments are joined.
+type LineJoin int
+
+const (
+	LineJoinMiter LineJoin = iota
+	LineJoinBevel
+	LineJoinRound
+)
+
+// StrokeOptions is options to render a stroke.
+type StrokeOptions struct {
+	// Width is the stroke width in pixels.
+	// Zero, infinite, and NaN widths produce no stroke. Negative finite widths cause a panic.
+	//
+	// The default (zero) value is 0.
+	Width float32
+
+	// LineCap is the way in which the ends of the stroke are rendered.
+	// Line caps are not rendered when the sub-path is marked as closed.
+	//
+	// The default (zero) value is [LineCapButt].
+	LineCap LineCap
+
+	// LineJoin is the way in which two segments are joined.
+	//
+	// The default (zero) value is [LineJoinMiter].
+	LineJoin LineJoin
+
+	// MiterLimit is the miter limit for [LineJoinMiter].
+	// A join whose miter ratio exceeds MiterLimit is rendered as a bevel join instead.
+	// The ratio is always 1 or greater, so a MiterLimit less than 1 renders every join as a bevel join.
+	// For details, see https://developer.mozilla.org/en-US/docs/Web/SVG/Attribute/stroke-miterlimit.
+	//
+	// The default (zero) value is 0, which renders every join as a bevel join.
+	MiterLimit float32
+}
+
+// AddStrokeOptions is options for [Path.AddStroke].
+type AddStrokeOptions struct {
+	// StrokeOptions is options for the stroke.
+	StrokeOptions
+
+	// GeoM is a geometry matrix to apply to the path.
+	//
+	// The default (zero) value is an identity matrix.
+	GeoM ebiten.GeoM
+}
+
+// AddStroke adds a stroke path to the path p.
+// After validating the width, AddStroke does nothing if the geometry matrix has an infinite or NaN element.
+//
+// The added stroke path must be rendered with FillRuleNonZero.
+func (p *Path) AddStroke(src *Path, options *AddStrokeOptions) {
+	if options == nil {
+		return
+	}
+	if !checkRegularNonNegative(float64(options.Width), "stroke width") || options.Width == 0 {
+		return
+	}
+
+	for i := range 2 {
+		for j := range 3 {
+			if !isRegular(options.GeoM.Element(i, j)) {
+				return
+			}
+		}
+	}
+
+	halfWidth := float64(options.Width) / 2
+
+	// p might be the same as src. Use srcN to avoid modifying the overlapped region.
+	srcN := len(src.subPaths)
+
+	// origN is the index of the first sub-path added by this call. MoveTo does not always add a new sub-path, so
+	// origN is determined right after the first MoveTo.
+	origN := -1
+
+	// Normalize each source sub-path to simplify the logic to generate a stroke path.
+	// Normalize into a scratch sub-path so that src is not modified. p.opsBuf is reused as its operations.
+	normalized := subPath{ops: p.opsBuf[:0]}
+	for i := range src.subPaths[:srcN] {
+		// When p is src, the sub-paths at origN and later are stroke output, not sources.
+		if src == p && origN >= 0 && i >= origN {
+			break
+		}
+		normalizeSubPath(&normalized, &src.subPaths[i])
+		if len(normalized.ops) == 0 {
+			continue
+		}
+
+		_, sp1, sp2, sp3, sp4 := strokeStartControlPositions(&normalized, halfWidth)
+		p.moveTo(sp4.x, sp4.y)
+		if origN < 0 {
+			// The last sub-path is the first stroke output whether MoveTo added it or reused an empty one.
+			// normalized has an op here, so the outline gets ops. Even if the outline stayed empty, the next
+			// MoveTo would reuse the same sub-path, so origN would still hold.
+			origN = len(p.subPaths) - 1
+		}
+
+		appendParalleledPathFromSubPath(p, &normalized, &options.StrokeOptions)
+		_, ep1, ep2, ep3, ep4 := strokeEndControlPositions(&normalized, halfWidth)
+		if normalized.closed {
+			p.Close()
+			p.moveTo(ep4.x, ep4.y)
+		} else {
+			switch options.LineCap {
+			case LineCapButt:
+				p.lineTo(ep4.x, ep4.y)
+			case LineCapRound:
+				p.arcTo(ep1.x, ep1.y, ep2.x, ep2.y, halfWidth)
+				p.arcTo(ep3.x, ep3.y, ep4.x, ep4.y, halfWidth)
+			case LineCapSquare:
+				p.lineTo(ep1.x, ep1.y)
+				p.lineTo(ep3.x, ep3.y)
+				p.lineTo(ep4.x, ep4.y)
+			}
+		}
+		appendParalleledPathFromSubPathReversed(p, &normalized, &options.StrokeOptions)
+		if !normalized.closed {
+			switch options.LineCap {
+			case LineCapButt:
+				p.lineTo(sp4.x, sp4.y)
+			case LineCapRound:
+				p.arcTo(sp1.x, sp1.y, sp2.x, sp2.y, halfWidth)
+				p.arcTo(sp3.x, sp3.y, sp4.x, sp4.y, halfWidth)
+			case LineCapSquare:
+				p.lineTo(sp1.x, sp1.y)
+				p.lineTo(sp3.x, sp3.y)
+				p.lineTo(sp4.x, sp4.y)
+			}
+		}
+		p.Close()
+	}
+	p.opsBuf = normalized.ops[:0]
+
+	if origN >= 0 && options.GeoM != (ebiten.GeoM{}) {
+		for i, subPath := range p.subPaths[origN:] {
+			x, y := options.GeoM.Apply(subPath.start.x, subPath.start.y)
+			p.subPaths[origN+i].start = point{
+				x: x,
+				y: y,
+			}
+			for j, op := range subPath.ops {
+				switch op.typ {
+				case opTypeLineTo:
+					x1, y1 := options.GeoM.Apply(op.p1.x, op.p1.y)
+					p.subPaths[origN+i].ops[j].p1 = point{
+						x: x1,
+						y: y1,
+					}
+				case opTypeQuadTo:
+					x1, y1 := options.GeoM.Apply(op.p1.x, op.p1.y)
+					x2, y2 := options.GeoM.Apply(op.p2.x, op.p2.y)
+					p.subPaths[origN+i].ops[j].p1 = point{
+						x: x1,
+						y: y1,
+					}
+					p.subPaths[origN+i].ops[j].p2 = point{
+						x: x2,
+						y: y2,
+					}
+				}
+			}
+			p.subPaths[origN+i].updateValidity()
+		}
+	}
+}
+
+func strokeStartControlPositions(subPath *subPath, dist float64) (point, point, point, point, point) {
+	p := subPath.startAtOp(0)
+	dir := subPath.startDir(0).inv().norm().mul(dist)
+	dirPerp := dir.perp()
+	// TODO: These values are a little tricky. Refactor this.
+	return p.add(dirPerp), p.add(dir.add(dirPerp)), p.add(dir), p.add(dir.add(dirPerp.inv())), p.add(dirPerp.inv())
+}
+
+func strokeEndControlPositions(subPath *subPath, dist float64) (point, point, point, point, point) {
+	p := subPath.endAtOp(len(subPath.ops) - 1)
+	dir := subPath.endDir(len(subPath.ops) - 1).norm().mul(dist)
+	dirPerp := dir.perp()
+	// TODO: These values are a little tricky. Refactor this.
+	return p.add(dirPerp), p.add(dir.add(dirPerp)), p.add(dir), p.add(dir.add(dirPerp.inv())), p.add(dirPerp.inv())
+}
+
+func appendParalleledPathFromSubPath(strokePath *Path, subPath *subPath, options *StrokeOptions) {
+	if len(subPath.ops) == 0 {
+		panic("not reached")
+	}
+
+	// As the source path is normalized, every operation is guaranteed to be valid.
+	// A line operation must have a different point from the start point.
+	// A quadratic curve operation must not be a single point nor a cusp, which are dropped or converted into lines by normalizeSubPath.
+
+	cur := subPath.start
+
+	dist := float64(options.Width) / 2
+	for i, op := range subPath.ops {
+		switch op.typ {
+		case opTypeLineTo:
+			appendParalleledLine(strokePath, cur, op.p1, dist)
+			cur = op.p1
+		case opTypeQuadTo:
+			appendParalleledQuad(strokePath, cur, op.p1, op.p2, dist)
+			cur = op.p2
+		}
+		// Add a joint between this operation and the next operation.
+		// This also renders the 180-degree turn at the tip of a cusp, which normalizeSubPath converted into two lines.
+		addJoint(strokePath, subPath, i, false, options)
+	}
+}
+
+func appendParalleledPathFromSubPathReversed(strokePath *Path, subPath *subPath, options *StrokeOptions) {
+	if len(subPath.ops) == 0 {
+		panic("not reached")
+	}
+
+	// As the source path is normalized, every operation is guaranteed to be valid.
+	// A line operation must have a different point from the start point.
+	// A quadratic curve operation must not be a single point nor a cusp, which are dropped or converted into lines by normalizeSubPath.
+
+	dist := float64(options.Width) / 2
+	for i, op := range slices.Backward(subPath.ops) {
+		nextP := subPath.startAtOp(i)
+		switch op.typ {
+		case opTypeLineTo:
+			appendParalleledLine(strokePath, op.p1, nextP, dist)
+		case opTypeQuadTo:
+			appendParalleledQuad(strokePath, op.p2, op.p1, nextP, dist)
+		}
+		// Add a joint between this operation and the previous operation.
+		// This also renders the 180-degree turn at the tip of a cusp, which normalizeSubPath converted into two lines.
+		addJoint(strokePath, subPath, i, true, options)
+	}
+}
+
+func appendParalleledLine(path *Path, p0, p1 point, dist float64) {
+	if p0 == p1 {
+		panic("not reached")
+	}
+
+	dir := vec2{
+		x: p1.x - p0.x,
+		y: p1.y - p0.y,
+	}
+	v := dir.perp().norm().mul(dist)
+	pp1 := p1.add(v)
+	path.lineTo(pp1.x, pp1.y)
+}
+
+// appendParalleledLineForQuadIfNeeded appends a paralleled line for a quadratic curve if the quadratic curve is just a line.
+func appendParalleledLineForQuadIfNeeded(path *Path, p0, p1, p2 point, dist float64) bool {
+	if p0 == p1 && p0 == p2 {
+		panic("not reached")
+	}
+	// A normalized path never has a cusp, whose start and end points are the same,
+	// as normalizeSubPath drops a single point and converts a cusp into two lines.
+	// This can happen only in doAppendParalleledQuad when a tiny curve is split,
+	// and then the split halves collapse to the same point.
+	if p0 == p2 {
+		return true
+	}
+	// This curve is a line as p0, p1, and p2 are on the same line.
+	if arePointsCollinear(p0, p1, p2) {
+		appendParalleledLine(path, p0, p2, dist)
+		return true
+	}
+	return false
+}
+
+func appendParalleledQuad(path *Path, p0, p1, p2 point, dist float64) {
+	if appendParalleledLineForQuadIfNeeded(path, p0, p1, p2, dist) {
+		return
+	}
+	doAppendParalleledQuad(path, p0, p1, p2, dist, 0)
+}
+
+func doAppendParalleledQuad(path *Path, p0, p1, p2 point, dist float64, level int) {
+	if p0 == p1 && p0 == p2 {
+		return
+	}
+	if appendParalleledLineForQuadIfNeeded(path, p0, p1, p2, dist) {
+		return
+	}
+
+	// B(t) = (1-t)*(1-t)*p0 + 2*(1-t)*t*p1 + t*t*p2
+	// B'(t) = 2*(1-t)*(p1-p0) + 2*t*(p2-p1)
+	// B'(0) = 2*(p1-p0)
+	// B'(0.5) = p2-p0
+	// B'(1) = 2*(p2-p1)
+	// B''(t) = 2*(p0 - 2*p1 + p2)
+
+	// t = 0
+	dir0 := vec2{
+		x: p1.x - p0.x,
+		y: p1.y - p0.y,
+	}
+	v0 := dir0.perp().norm().mul(dist)
+	pp0 := p0.add(v0)
+
+	// t = 1
+	dir2 := vec2{
+		x: p2.x - p1.x,
+		y: p2.y - p1.y,
+	}
+	v2 := dir2.perp().norm().mul(dist)
+	pp2 := p2.add(v2)
+
+	// t = 0.5
+	dir1 := vec2{
+		x: p2.x - p0.x,
+		y: p2.y - p0.y,
+	}
+	v1 := dir1.perp().norm().mul(dist)
+	mid := point{
+		x: 0.25*p0.x + 0.5*p1.x + 0.25*p2.x,
+		y: 0.25*p0.y + 0.5*p1.y + 0.25*p2.y,
+	}.add(v1)
+	// Calculate the control point P1 from B(0.5).
+	pp1 := point{
+		x: 2*mid.x - 0.5*(pp0.x+pp2.x),
+		y: 2*mid.y - 0.5*(pp0.y+pp2.y),
+	}
+
+	if level > 5 {
+		path.quadTo(pp1.x, pp1.y, pp2.x, pp2.y)
+		return
+	}
+
+	// If any of the points cannot be represented by finite rendering vertices, do not call this function recursively.
+	if !isRegularPoint(pp0) || !isRegularPoint(pp1) || !isRegularPoint(pp2) {
+		path.quadTo(pp1.x, pp1.y, pp2.x, pp2.y)
+		return
+	}
+
+	minAllowance := max(dist*63/64, 0)
+	maxAllowance := dist * 65 / 64
+
+	var needSplit bool
+	for _, t := range []float64{0.25, 0.75} {
+		gotP := point{
+			x: (1-t)*(1-t)*pp0.x + 2*(1-t)*t*pp1.x + t*t*pp2.x,
+			y: (1-t)*(1-t)*pp0.y + 2*(1-t)*t*pp1.y + t*t*pp2.y,
+		}
+
+		dir := vec2{
+			x: (1-t)*dir0.x + t*dir2.x,
+			y: (1-t)*dir0.y + t*dir2.y,
+		}
+		v := dir.perp().norm().mul(dist)
+		p := point{
+			x: (1-t)*(1-t)*p0.x + 2*(1-t)*t*p1.x + t*t*p2.x,
+			y: (1-t)*(1-t)*p0.y + 2*(1-t)*t*p1.y + t*t*p2.y,
+		}.add(v)
+		expectedP := p.add(v)
+
+		if !arePointsInRange(gotP, expectedP, minAllowance, maxAllowance) {
+			needSplit = true
+			break
+		}
+	}
+
+	if !needSplit {
+		path.quadTo(pp1.x, pp1.y, pp2.x, pp2.y)
+		return
+	}
+
+	// Split a quadratic curve into two quadratic curves by De Casteljau algorithm.
+	p01 := point{
+		x: (p0.x + p1.x) / 2,
+		y: (p0.y + p1.y) / 2,
+	}
+	p12 := point{
+		x: (p1.x + p2.x) / 2,
+		y: (p1.y + p2.y) / 2,
+	}
+	p012 := point{
+		x: (p01.x + p12.x) / 2,
+		y: (p01.y + p12.y) / 2,
+	}
+	doAppendParalleledQuad(path, p0, p01, p012, dist, level+1)
+	doAppendParalleledQuad(path, p012, p12, p2, dist, level+1)
+}
+
+func addJoint(strokePath *Path, subPath *subPath, opIndex int, reverse bool, options *StrokeOptions) {
+	var p point
+	var dir0, dir1 vec2
+	if !reverse {
+		nextOpIdx := opIndex + 1
+		if nextOpIdx == len(subPath.ops) {
+			if !subPath.closed {
+				return
+			}
+			nextOpIdx = 0
+		}
+		p = subPath.endAtOp(opIndex)
+		dir0 = subPath.endDir(opIndex).norm()
+		dir1 = subPath.startDir(nextOpIdx).norm()
+	} else {
+		nextOpIdx := opIndex - 1
+		if nextOpIdx == -1 {
+			if !subPath.closed {
+				return
+			}
+			nextOpIdx = len(subPath.ops) - 1
+		}
+		p = subPath.startAtOp(opIndex)
+		dir0 = subPath.startDir(opIndex).inv().norm()
+		dir1 = subPath.endDir(nextOpIdx).inv().norm()
+	}
+
+	if dir0 == dir1 {
+		return
+	}
+
+	dist := float64(options.Width) / 2
+	v1 := dir1.perp().mul(dist)
+	p1 := p.add(v1)
+
+	// If the joint is an internal angle (< 180 degrees), the joint is not rendered. Just connect the two segments.
+	// A cross product can be calculated by dir0.x*dir1.y - dir0.y*dir1.x,
+	// but a fused multiply-subtract can produce a nonzero result from equal products.
+	if dir0.x*dir1.y > dir0.y*dir1.x {
+		strokePath.lineTo(p1.x, p1.y)
+		return
+	}
+
+	v0 := dir0.perp().mul(dist)
+
+	// Add a joint.
+	switch options.LineJoin {
+	case LineJoinMiter:
+		dot := min(max(dir0.x*(-dir1.x)+dir0.y*(-dir1.y), -1.0), 1.0)
+		theta := math.Acos(dot)
+		exceed := float32(math.Abs(1/math.Sin(theta/2))) > options.MiterLimit
+		if !exceed {
+			// Intersect offsets around the joint, keeping the directions separate from the coordinates.
+			cp := p.add(crossingPointForTwoLines(v0, dir0, v1, dir1))
+			if isRegularPoint(cp) {
+				strokePath.lineTo(cp.x, cp.y)
+			}
+		}
+		strokePath.lineTo(p1.x, p1.y)
+	case LineJoinBevel:
+		strokePath.lineTo(p1.x, p1.y)
+	case LineJoinRound:
+		// Sweep an arc around p on the outer side of the turn.
+		// Derive the sweep angle from the directions to handle the branch cut at a nearly straight joint.
+		// math.Abs clears a negative zero, so a cusp sweeps π rather than -π.
+		// The explicit conversions avoid a fused multiply-subtract.
+		a0 := float32(math.Atan2(v0.y, v0.x))
+		cross := math.Abs(float64(dir0.x*dir1.y) - float64(dir0.y*dir1.x))
+		dot := dir0.x*dir1.x + dir0.y*dir1.y
+		a1 := a0 - float32(math.Atan2(cross, dot))
+		if isRegular(float64(a0)) && isRegular(float64(a1)) {
+			strokePath.addArc(p.x, p.y, dist, a0, a1, CounterClockwise)
+		} else {
+			strokePath.lineTo(p1.x, p1.y)
+		}
+	}
+}

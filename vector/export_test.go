@@ -1,0 +1,152 @@
+// Copyright 2024 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package vector
+
+import (
+	"fmt"
+	"image"
+	"strings"
+
+	"github.com/hajimehoshi/ebiten/v2"
+)
+
+type Point struct {
+	X, Y float32
+}
+
+func ArePointsInRange(p0, p1 Point, allowanceMin, allowanceMax float32) bool {
+	return arePointsInRange(point{
+		x: float64(p0.X),
+		y: float64(p0.Y),
+	}, point{
+		x: float64(p1.X),
+		y: float64(p1.Y),
+	}, float64(allowanceMin), float64(allowanceMax))
+}
+
+func CrossingPointForTwoLines(p00, p01, p10, p11 Point) Point {
+	p := crossingPointForTwoLines(vec2{
+		x: float64(p00.X),
+		y: float64(p00.Y),
+	}, vec2{
+		x: float64(p01.X) - float64(p00.X),
+		y: float64(p01.Y) - float64(p00.Y),
+	}, vec2{
+		x: float64(p10.X),
+		y: float64(p10.Y),
+	}, vec2{
+		x: float64(p11.X) - float64(p10.X),
+		y: float64(p11.Y) - float64(p10.Y),
+	})
+	return Point{X: float32(p.x), Y: float32(p.y)}
+}
+
+func (p Point) String() string {
+	return fmt.Sprintf("(%f, %f)", p.X, p.Y)
+}
+
+func IsPointCloseToSegment(p, p0, p1 Point, allow float32) bool {
+	return isPointCloseToSegment(point{
+		x: float64(p.X),
+		y: float64(p.Y),
+	}, point{
+		x: float64(p0.X),
+		y: float64(p0.Y),
+	}, point{
+		x: float64(p1.X),
+		y: float64(p1.Y),
+	}, float64(allow))
+}
+
+func ArePointsCollinear(p0, p1, p2 Point) bool {
+	return arePointsCollinear(point{
+		x: float64(p0.X),
+		y: float64(p0.Y),
+	}, point{
+		x: float64(p1.X),
+		y: float64(p1.Y),
+	}, point{
+		x: float64(p2.X),
+		y: float64(p2.Y),
+	})
+}
+
+func CurrentPosition(path *Path) (Point, bool) {
+	p, ok := path.currentPosition()
+	if !ok {
+		return Point{}, false
+	}
+	return Point{X: float32(p.x), Y: float32(p.y)}, true
+}
+
+func SubPathCount(path *Path) int {
+	return len(path.subPaths)
+}
+
+// PathOperationsString returns a string representation of the operations in the path.
+func PathOperationsString(path *Path) string {
+	var sb strings.Builder
+	for _, subPath := range path.subPaths {
+		sb.WriteString(fmt.Sprintf("MoveTo(%v, %v)\n", subPath.start.x, subPath.start.y))
+		for _, o := range subPath.ops {
+			switch o.typ {
+			case opTypeLineTo:
+				sb.WriteString(fmt.Sprintf("LineTo(%v, %v)\n", o.p1.x, o.p1.y))
+			case opTypeQuadTo:
+				sb.WriteString(fmt.Sprintf("QuadTo(%v, %v, %v, %v)\n", o.p1.x, o.p1.y, o.p2.x, o.p2.y))
+			}
+		}
+		if subPath.closed {
+			sb.WriteString("Close()\n")
+		}
+	}
+	return sb.String()
+}
+
+func FillPathsStateCount() int {
+	theFillPathM.Lock()
+	defer theFillPathM.Unlock()
+	return len(theFillPathsStates)
+}
+
+func CallbackTokenCount() int {
+	theFillPathM.Lock()
+	defer theFillPathM.Unlock()
+	return len(theCallbackTokens)
+}
+
+func CircleVertexCount(radius float64) int {
+	return circleVertexCount(radius)
+}
+
+func AtlasImageCount(dstBounds image.Rectangle, paths []*Path, bounds []image.Rectangle, antialias bool) int {
+	var a atlas
+	a.setPaths(dstBounds, paths, bounds, antialias)
+	for _, img := range a.atlasImages {
+		img.Deallocate()
+	}
+	return len(a.atlasImages)
+}
+
+func StrokeLineGeoM(x0, y0, x1, y1, strokeWidth float32) ebiten.GeoM {
+	return strokeLineGeoM(x0, y0, x1, y1, strokeWidth)
+}
+
+func UtilDrawingVertices(draw func()) []ebiten.Vertex {
+	draw()
+	theCacheForUtilM.Lock()
+	defer theCacheForUtilM.Unlock()
+	return append([]ebiten.Vertex(nil), theCachedVerticesForUtil...)
+}

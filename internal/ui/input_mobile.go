@@ -1,0 +1,128 @@
+// Copyright 2016 Hajime Hoshi
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build android || ios
+
+package ui
+
+type KeyEvent struct {
+	Key     Key
+	Pressed bool
+}
+
+type TouchForInput struct {
+	// ID is the ID the platform assigns to the touch.
+	ID int
+
+	// X is in device-independent pixels.
+	X float64
+
+	// Y is in device-independent pixels.
+	Y float64
+}
+
+func (u *UserInterface) updateInputStateFromOutside(keys []KeyEvent, runes []rune, touches []TouchForInput, capsLock, numLock LockKeyState) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if !u.foreground.Load() {
+		return
+	}
+
+	for _, key := range keys {
+		t := u.inputState.nextInputTime()
+		if key.Pressed {
+			u.inputState.setKeyPressed(key.Key, t)
+		} else {
+			u.inputState.setKeyReleased(key.Key, t)
+		}
+	}
+	u.inputState.Runes = append(u.inputState.Runes, runes...)
+	u.inputState.CapsLock = capsLock
+	u.inputState.NumLock = numLock
+	u.touches = u.touches[:0]
+	u.touchIDs.nextTouches()
+	for _, t := range touches {
+		u.touches = append(u.touches, touchInClient{
+			id: u.touchIDs.id(t.ID),
+			x:  t.X,
+			y:  t.Y,
+		})
+	}
+}
+
+func (u *UserInterface) updatePinchFromOutside(delta float64, centerX, centerY float64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if !u.foreground.Load() {
+		return
+	}
+
+	u.pinchDelta = composePinches(u.pinchDelta, delta)
+	u.setGestureCenter(centerX, centerY)
+}
+
+func (u *UserInterface) updateRotationFromOutside(delta float64, centerX, centerY float64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if !u.foreground.Load() {
+		return
+	}
+
+	u.rotationDelta += delta
+	u.setGestureCenter(centerX, centerY)
+}
+
+// setGestureCenter records the point a gesture is done around. setGestureCenter must be called with u.mu
+// held.
+func (u *UserInterface) setGestureCenter(x, y float64) {
+	u.gestureCenterXInClient = x
+	u.gestureCenterYInClient = y
+	u.gestureCenterReported = true
+}
+
+func (u *UserInterface) updateInputStateForFrame(deviceScaleFactor float64) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	s := deviceScaleFactor
+
+	u.inputState.addPinch(u.pinchDelta)
+	u.inputState.RotationDelta += u.rotationDelta
+	u.pinchDelta = 0
+	u.rotationDelta = 0
+	if u.gestureCenterReported {
+		u.inputState.GestureCenterX, u.inputState.GestureCenterY = u.context.clientPositionToLogicalPosition(u.gestureCenterXInClient, u.gestureCenterYInClient, s)
+		u.inputState.GestureCenterReported = true
+		u.gestureCenterReported = false
+	}
+
+	u.inputState.Touches = u.inputState.Touches[:0]
+	for _, t := range u.touches {
+		x, y := u.context.clientPositionToLogicalPosition(t.x, t.y, s)
+		u.inputState.Touches = append(u.inputState.Touches, Touch{
+			ID: t.id,
+			X:  x,
+			Y:  y,
+		})
+	}
+	return nil
+}
+
+func (u *UserInterface) KeyName(key Key) string {
+	// TODO: Implement this.
+	return ""
+}

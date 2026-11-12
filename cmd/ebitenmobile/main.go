@@ -1,0 +1,363 @@
+// Copyright 2019 The Ebiten Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// ebitenmobile is a wrapper of gomobile for Ebitengine.
+//
+// For the usage, see https://ebitengine.org/en/documents/mobile.html.
+//
+// ebitenmobile uses github.com/ebitengine/gomobile for gomobile, not golang.org/x/mobile.
+// gomobile's version is fixed by ebitenmobile.
+// You can use a local checkout of gomobile by setting EBITENMOBILE_GOMOBILE to the path to the checkout.
+package main
+
+import (
+	"bytes"
+	_ "embed"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"text/template"
+	"unicode"
+
+	"golang.org/x/tools/go/packages"
+)
+
+const (
+	ebitenmobileCommand = "ebitenmobile"
+)
+
+//go:embed _files/EbitenViewController.h
+var objcH string
+
+var (
+	buildA          bool   // -a
+	buildI          bool   // -i
+	buildN          bool   // -n
+	buildV          bool   // -v
+	buildX          bool   // -x
+	buildO          string // -o
+	buildGcflags    string // -gcflags
+	buildLdflags    string // -ldflags
+	buildTarget     string // -target
+	buildTrimpath   bool   // -trimpath
+	buildWork       bool   // -work
+	buildBundleID   string // -bundleid
+	buildIOSVersion string // -iosversion
+	buildAndroidAPI int    // -androidapi
+	buildTags       string // -tags
+
+	bindPrefix        string // -prefix
+	bindJavaPkg       string // -javapkg
+	bindClasspath     string // -classpath
+	bindBootClasspath string // -bootclasspath
+)
+
+type usageError string
+
+func (e usageError) Error() string {
+	return string(e)
+}
+
+func main() {
+	if err := xmain(); err != nil {
+		if _, ok := err.(usageError); ok {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		log.Fatal(err)
+	}
+}
+
+func xmain() error {
+	flag.Usage = func() {
+		// This message is copied from `gomobile bind -h`
+		fmt.Fprintf(os.Stderr, "%s bind [-target android|ios] [-bootclasspath <path>] [-classpath <path>] [-o output] [build flags] [package]\n", ebitenmobileCommand)
+	}
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 || args[0] != "bind" {
+		flag.Usage()
+		return usageError("expected bind command")
+	}
+
+	// minAndroidAPI specifies the minimum API version for Android.
+	// Now Google Play services v23.30.99+ drops API levels that are older than 21.
+	// See https://apilevels.com/.
+	const minAndroidAPI = 21
+
+	var flagset flag.FlagSet
+	flagset.Init("", flag.ExitOnError)
+	flagset.StringVar(&buildO, "o", "", "")
+	flagset.StringVar(&buildGcflags, "gcflags", "", "")
+	flagset.StringVar(&buildLdflags, "ldflags", "", "")
+	flagset.StringVar(&buildTarget, "target", "android", "")
+	flagset.StringVar(&buildBundleID, "bundleid", "", "")
+	flagset.StringVar(&buildIOSVersion, "iosversion", "7.0", "")
+	flagset.StringVar(&buildTags, "tags", "", "")
+	flagset.IntVar(&buildAndroidAPI, "androidapi", minAndroidAPI, "")
+	flagset.BoolVar(&buildA, "a", false, "")
+	flagset.BoolVar(&buildI, "i", false, "")
+	flagset.BoolVar(&buildN, "n", false, "")
+	flagset.BoolVar(&buildV, "v", false, "")
+	flagset.BoolVar(&buildX, "x", false, "")
+	flagset.BoolVar(&buildTrimpath, "trimpath", false, "")
+	flagset.BoolVar(&buildWork, "work", false, "")
+	flagset.StringVar(&bindJavaPkg, "javapkg", "", "")
+	flagset.StringVar(&bindPrefix, "prefix", "", "")
+	flagset.StringVar(&bindClasspath, "classpath", "", "")
+	flagset.StringVar(&bindBootClasspath, "bootclasspath", "", "")
+
+	_ = flagset.Parse(args[1:])
+
+	buildTarget, err := osFromBuildTarget(buildTarget)
+	if err != nil {
+		return err
+	}
+
+	// Add ldflags to suppress linker errors (#932).
+	// See https://github.com/golang/go/issues/17807
+	if buildTarget == "android" {
+		if buildLdflags != "" {
+			buildLdflags += " "
+		}
+		buildLdflags += "-extldflags=-Wl,-soname,libgojni.so"
+
+		if !isValidJavaPackageName(bindJavaPkg) {
+			return usageError(fmt.Sprintf("invalid Java package name: %s", bindJavaPkg))
+		}
+	}
+
+	if buildO == "" {
+		return usageError("-o must be specified")
+	}
+
+	dir, err := prepareGomobileCommands()
+	defer func() {
+		if dir != "" && !buildWork {
+			_ = removeAll(dir)
+		}
+	}()
+	if err != nil {
+		return err
+	}
+
+	// If args doesn't include '-androidapi', add it to args explicitly.
+	// It's because ebitenmobile's default API level is different from gomobile's one.
+	if buildTarget == "android" && buildAndroidAPI == minAndroidAPI {
+		var found bool
+		flagset.Visit(func(f *flag.Flag) {
+			if f.Name == "androidapi" {
+				found = true
+			}
+		})
+		if !found {
+			args = append([]string{args[0], "-androidapi", fmt.Sprintf("%d", minAndroidAPI)}, args[1:]...)
+		}
+	}
+
+	return doBind(args, &flagset, buildTarget)
+}
+
+func osFromBuildTarget(buildTarget string) (string, error) {
+	var os string
+	for i, pair := range strings.Split(buildTarget, ",") {
+		osarch := strings.SplitN(pair, "/", 2)
+		if i == 0 {
+			os = osarch[0]
+		}
+		if os != osarch[0] {
+			return "", fmt.Errorf("ebitenmobile: cannot target different OSes")
+		}
+	}
+	if os == "ios" {
+		os = "darwin"
+	}
+	return os, nil
+}
+
+// frameworkName returns the name of the framework in the xcframework at buildO, without the .framework extension.
+func frameworkName(buildO string) string {
+	base := strings.TrimSuffix(filepath.Base(buildO), ".xcframework")
+	// The first character must be an upper case (#2192).
+	// gomobile names the framework with strings.Title (see cmd/gomobile/bind_iosapp.go). Use the same
+	// function so that the directory name matches.
+	return strings.Title(base)
+}
+
+func doBind(args []string, flagset *flag.FlagSet, buildOS string) error {
+	tags := buildTags
+	cfg := &packages.Config{}
+	cfg.Env = append(os.Environ(), "GOOS="+buildOS)
+	if buildOS == "darwin" {
+		if tags != "" {
+			tags += " "
+		}
+		tags += "ios"
+	}
+	cfg.BuildFlags = []string{"-tags", tags}
+
+	flagsetArgs := flagset.Args()
+	if len(flagsetArgs) == 0 {
+		flagsetArgs = []string{"."}
+	}
+	pkgs, err := packages.Load(cfg, flagsetArgs[0])
+	if err != nil {
+		return err
+	}
+	prefixLower := bindPrefix + pkgs[0].Name
+	// gomobile derives its Objective-C names from the raw prefix and strings.Title of the package name
+	// (see bind/genobjc.go in github.com/ebitengine/gomobile). Use the same rule so that the names match.
+	prefixUpper := bindPrefix + strings.Title(pkgs[0].Name)
+
+	args = append(args, "github.com/hajimehoshi/ebiten/v2/mobile/ebitenmobileview")
+
+	if buildN {
+		fmt.Print("gomobile")
+		for _, arg := range args {
+			fmt.Print(" ", arg)
+		}
+		fmt.Println()
+		return nil
+	}
+
+	cmd := exec.Command("gomobile", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	replacePrefixes := func(content string) string {
+		content = strings.ReplaceAll(content, "{{.PrefixUpper}}", prefixUpper)
+		content = strings.ReplaceAll(content, "{{.PrefixLower}}", prefixLower)
+		return content
+	}
+
+	if buildOS == "darwin" {
+		dirEntries, err := os.ReadDir(buildO)
+		if err != nil {
+			return err
+		}
+
+		for _, dirEntry := range dirEntries {
+			// Skip stray files like .DS_Store. Only directories are platform slices.
+			if !dirEntry.IsDir() {
+				continue
+			}
+			dir := filepath.Join(buildO, dirEntry.Name(), frameworkName(buildO)+".framework")
+
+			if err := os.WriteFile(filepath.Join(dir, "Headers", prefixUpper+"EbitenViewController.h"), []byte(replacePrefixes(objcH)), 0644); err != nil {
+				return err
+			}
+			// TODO: Remove 'Ebitenmobileview.objc.h' here. Now it is hard since there is a header file importing
+			// that header file.
+
+			fs, err := os.ReadDir(filepath.Join(dir, "Headers"))
+			if err != nil {
+				return err
+			}
+			var headerFiles []string
+			for _, f := range fs {
+				if strings.HasSuffix(f.Name(), ".h") {
+					headerFiles = append(headerFiles, f.Name())
+				}
+			}
+
+			// The module name must be the framework name, or `@import` and Swift's `import` cannot find the module.
+			// This is also what gomobile writes (see cmd/gomobile/bind_iosapp.go).
+			if err := writeIOSModuleMap(filepath.Join(dir, "Modules", "module.modulemap"), frameworkName(buildO), headerFiles); err != nil {
+				return err
+			}
+
+			// TODO: Remove Ebitenmobileview.objc.h?
+		}
+	}
+
+	return nil
+}
+
+var iosModuleMapTmpl = template.Must(template.New("iosmmap").Parse(`framework module "{{.Module}}" {
+{{range .Headers}}    header "{{.}}"
+{{end}}
+    export *
+}`))
+
+// writeIOSModuleMap writes the module map for the framework module with the given headers to path.
+func writeIOSModuleMap(path string, module string, headers []string) error {
+	var mmVals = struct {
+		Module  string
+		Headers []string
+	}{
+		Module:  module,
+		Headers: headers,
+	}
+	var buf bytes.Buffer
+	if err := iosModuleMapTmpl.Execute(&buf, mmVals); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0644)
+}
+
+func isValidJavaPackageName(name string) bool {
+	if name == "" {
+		return false
+	}
+	// A Java package name consists of one or more Java identifiers separated by dots.
+	for token := range strings.SplitSeq(name, ".") {
+		if !isValidJavaIdentifier(token) {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidJavaIdentifier reports whether the given string is a valid Java identifier.
+func isValidJavaIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+
+	// Java identifiers must not be a Java keyword or a boolean/null literal.
+	// https://docs.oracle.com/javase/specs/jls/se21/html/jls-3.html#jls-Identifier
+	switch name {
+	case "_", "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int", "interface", "long", "native", "new", "package", "private", "protected", "public", "return", "short", "static", "strictfp", "super", "switch", "synchronized", "this", "throw", "throws", "transient", "try", "void", "volatile", "while":
+		return false
+	}
+	if name == "null" || name == "true" || name == "false" {
+		return false
+	}
+
+	// References:
+	// * https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Character.html#isJavaIdentifierPart(int)
+	// * https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/Character.html#isJavaIdentifierStart(int)
+
+	isJavaLetter := func(r rune) bool {
+		return unicode.IsLetter(r) || unicode.Is(unicode.Pc, r) || unicode.Is(unicode.Sc, r)
+	}
+	isJavaDigit := unicode.IsDigit
+
+	// A Java identifier is a Java letter or Java letter followed by Java letters or Java digits.
+	// https://docs.oracle.com/javase/specs/jls/se21/html/jls-3.html#jls-Identifier
+	for i, r := range name {
+		if !isJavaLetter(r) && (i == 0 || !isJavaDigit(r)) {
+			return false
+		}
+	}
+	return true
+}

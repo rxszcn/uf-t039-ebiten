@@ -1,0 +1,81 @@
+// Copyright 2026 The Ebitengine Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package glfw
+
+import "runtime"
+
+func PackPoint64(x, y int32) uint64 {
+	return (_POINT{x: x, y: y}).pack64()
+}
+
+const WheelPageScroll = _WHEEL_PAGESCROLL
+
+func WheelScrollAmount(notches float64, setting uint32) (float64, ScrollUnit) {
+	return wheelScrollAmount(notches, setting)
+}
+
+var SetFocusForTesting = _SetFocus
+
+type DirectManipulationGesture struct {
+	g directManipulationGesture
+}
+
+func NewDirectManipulationGesture() *DirectManipulationGesture {
+	return &DirectManipulationGesture{
+		g: newDirectManipulationGesture(),
+	}
+}
+
+func (d *DirectManipulationGesture) Transform(m [6]float32) (panX, panY, pinch float64) {
+	return d.g.transform(m)
+}
+
+// DirectManipulationZoomToRect zooms the viewport of Direct Manipulation for a hidden window to the given
+// rectangle, and returns the content transform. It returns nil without an error when Direct Manipulation is
+// not available.
+func DirectManipulationZoomToRect(left, top, right, bottom float32) (*[6]float32, error) {
+	// Direct Manipulation is used from the thread that owns the window.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	hwnd, err := _CreateWindowExW(0, "STATIC", "", 0, 0, 0, directManipulationViewportSize, directManipulationViewportSize, 0, 0, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = _DestroyWindow(hwnd)
+	}()
+
+	d, err := newDirectManipulation(hwnd)
+	if err != nil {
+		return nil, err
+	}
+	if d == nil {
+		return nil, nil
+	}
+	defer d.release(hwnd)
+
+	if err := d.zoomToRect(left, top, right, bottom, false); err != nil {
+		return nil, err
+	}
+	if err := d.updateManager.Update(); err != nil {
+		return nil, err
+	}
+	m, err := d.content.GetContentTransform()
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
