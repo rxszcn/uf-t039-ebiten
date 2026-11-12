@@ -86,19 +86,9 @@ func StrokeLine(dst *ebiten.Image, x0, y0, x1, y1 float32, strokeWidth float32, 
 		return
 	}
 	if antialias {
-		path := thePathPool.Get().(*Path)
-		defer func() {
-			path.Reset()
-			thePathPool.Put(path)
-		}()
-		path.MoveTo(x0, y0)
-		path.LineTo(x1, y1)
-		strokeOp := &StrokeOptions{}
-		strokeOp.Width = strokeWidth
-		drawOp := &DrawPathOptions{}
-		drawOp.AntiAlias = true
-		drawOp.ColorScale.ScaleWithColor(clr)
-		StrokePath(dst, path, strokeOp, drawOp)
+		var cs ebiten.ColorScale
+		cs.ScaleWithColor(clr)
+		analyticStrokeLine(dst, float64(x0), float64(y0), float64(x1), float64(y1), float64(strokeWidth), cs, ebiten.BlendSourceOver)
 		return
 	}
 
@@ -137,19 +127,9 @@ func fillRect(dst *ebiten.Image, x, y, width, height float64, clr color.Color, a
 	}
 
 	if antialias {
-		path := thePathPool.Get().(*Path)
-		defer func() {
-			path.Reset()
-			thePathPool.Put(path)
-		}()
-		path.moveTo(x, y)
-		path.lineTo(x, y+height)
-		path.lineTo(x+width, y+height)
-		path.lineTo(x+width, y)
-		drawOp := &DrawPathOptions{}
-		drawOp.AntiAlias = true
-		drawOp.ColorScale.ScaleWithColor(clr)
-		FillPath(dst, path, nil, drawOp)
+		var cs ebiten.ColorScale
+		cs.ScaleWithColor(clr)
+		analyticFillRect(dst, x, y, width, height, cs, ebiten.BlendSourceOver)
 		return
 	}
 
@@ -295,16 +275,9 @@ func fillCircle(dst *ebiten.Image, cx, cy, r float64, clr color.Color, antialias
 	}
 
 	if antialias {
-		path := thePathPool.Get().(*Path)
-		defer func() {
-			path.Reset()
-			thePathPool.Put(path)
-		}()
-		path.addArc(cx, cy, r, 0, 2*math.Pi, Clockwise)
-		drawOp := &DrawPathOptions{}
-		drawOp.AntiAlias = true
-		drawOp.ColorScale.ScaleWithColor(clr)
-		FillPath(dst, path, nil, drawOp)
+		var cs ebiten.ColorScale
+		cs.ScaleWithColor(clr)
+		analyticFillCircle(dst, cx, cy, r, cs, ebiten.BlendSourceOver)
 		return
 	}
 
@@ -381,20 +354,9 @@ func strokeCircle(dst *ebiten.Image, cx, cy, r, strokeWidth float64, clr color.C
 	}
 
 	if antialias {
-		path := thePathPool.Get().(*Path)
-		defer func() {
-			path.Reset()
-			thePathPool.Put(path)
-		}()
-		path.addArc(cx, cy, r, 0, 2*math.Pi, Clockwise)
-		path.Close()
-		strokeOp := &StrokeOptions{}
-		strokeOp.Width = float32(strokeWidth)
-		strokeOp.LineJoin = LineJoinRound
-		drawOp := &DrawPathOptions{}
-		drawOp.AntiAlias = true
-		drawOp.ColorScale.ScaleWithColor(clr)
-		StrokePath(dst, path, strokeOp, drawOp)
+		var cs ebiten.ColorScale
+		cs.ScaleWithColor(clr)
+		analyticStrokeCircle(dst, cx, cy, r, strokeWidth, cs, ebiten.BlendSourceOver)
 		return
 	}
 

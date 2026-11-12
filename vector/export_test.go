@@ -17,6 +17,7 @@ package vector
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"strings"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -149,4 +150,26 @@ func UtilDrawingVertices(draw func()) []ebiten.Vertex {
 	theCacheForUtilM.Lock()
 	defer theCacheForUtilM.Unlock()
 	return append([]ebiten.Vertex(nil), theCachedVerticesForUtil...)
+}
+
+func testColorScale(clr color.Color) ebiten.ColorScale {
+	var cs ebiten.ColorScale
+	cs.ScaleWithColor(clr)
+	return cs
+}
+
+func AnalyticFillRectForTest(dst *ebiten.Image, x, y, w, h float64, clr color.Color) {
+	analyticFillRect(dst, x, y, w, h, testColorScale(clr), ebiten.BlendSourceOver)
+}
+
+func AnalyticStrokeLineForTest(dst *ebiten.Image, x0, y0, x1, y1, width float64, clr color.Color) {
+	analyticStrokeLine(dst, x0, y0, x1, y1, width, testColorScale(clr), ebiten.BlendSourceOver)
+}
+
+func AnalyticFillCircleForTest(dst *ebiten.Image, cx, cy, r float64, clr color.Color) {
+	analyticFillCircle(dst, cx, cy, r, testColorScale(clr), ebiten.BlendSourceOver)
+}
+
+func AnalyticStrokeCircleForTest(dst *ebiten.Image, cx, cy, r, width float64, clr color.Color) {
+	analyticStrokeCircle(dst, cx, cy, r, width, testColorScale(clr), ebiten.BlendSourceOver)
 }
